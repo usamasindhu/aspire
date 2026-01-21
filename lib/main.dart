@@ -335,15 +335,16 @@ class _DashboardPageState extends State<DashboardPage> {
 
   Map<String, dynamic> _getStats() {
     Map<String, dynamic> stats = {
-      '11th_Boys': {'count': 0, 'collected': 0.0, 'pending': 0.0},
-      '11th_Girls': {'count': 0, 'collected': 0.0, 'pending': 0.0},
-      '12th_Boys': {'count': 0, 'collected': 0.0, 'pending': 0.0},
-      '12th_Girls': {'count': 0, 'collected': 0.0, 'pending': 0.0},
+      '11th_Boys': {'count': 0, 'collected': 0.0, 'pending': 0.0, 'totalPackage': 0.0},
+      '11th_Girls': {'count': 0, 'collected': 0.0, 'pending': 0.0, 'totalPackage': 0.0},
+      '12th_Boys': {'count': 0, 'collected': 0.0, 'pending': 0.0, 'totalPackage': 0.0},
+      '12th_Girls': {'count': 0, 'collected': 0.0, 'pending': 0.0, 'totalPackage': 0.0},
     };
 
     for (var student in students) {
       String key = '${student.studentClass}_${student.gender}';
       stats[key]['count']++;
+      stats[key]['totalPackage'] += student.totalPackage;
 
       double collected = 0;
       if (installmentsMap.containsKey(student.id.toString())) {
@@ -368,6 +369,7 @@ class _DashboardPageState extends State<DashboardPage> {
     final total12th = stats['12th_Boys']['count'] + stats['12th_Girls']['count'];
     final totalCollected = stats.values.fold(0.0, (sum, s) => sum + s['collected']);
     final totalPending = stats.values.fold(0.0, (sum, s) => sum + s['pending']);
+    final totalPackage = stats.values.fold(0.0, (sum, s) => sum + s['totalPackage']);
 
     return SingleChildScrollView(
       padding: EdgeInsets.all(24),
@@ -383,6 +385,8 @@ class _DashboardPageState extends State<DashboardPage> {
               Expanded(child: _buildStatCard('11th Year Students', total11th.toString(), Icons.school, Colors.blue)),
               SizedBox(width: 16),
               Expanded(child: _buildStatCard('12th Year Students', total12th.toString(), Icons.school, Colors.green)),
+              SizedBox(width: 16),
+              Expanded(child: _buildStatCard('Total Package', '${totalPackage.toStringAsFixed(0)} PKR', Icons.inventory, Colors.purple)),
               SizedBox(width: 16),
               Expanded(child: _buildStatCard('Total Collected', '${totalCollected.toStringAsFixed(0)} PKR', Icons.account_balance_wallet, Colors.teal)),
               SizedBox(width: 16),
@@ -401,7 +405,7 @@ class _DashboardPageState extends State<DashboardPage> {
             crossAxisCount: 2,
             mainAxisSpacing: 16,
             crossAxisSpacing: 16,
-            childAspectRatio: 2.5,
+            childAspectRatio: 2,
             children: [
               _buildClassCard('11th', 'Boys', stats['11th_Boys']),
               _buildClassCard('11th', 'Girls', stats['11th_Girls']),
@@ -440,6 +444,9 @@ class _DashboardPageState extends State<DashboardPage> {
   Widget _buildClassCard(String classYear, String gender, Map<String, dynamic> data) {
     double collected = data['collected'];
     double pending = data['pending'];
+    double totalPackage = data['totalPackage'];
+    int count = data['count'];
+    double psa = count > 0 ? (totalPackage / count) : 0;
     double total = collected + pending;
     double percentage = total > 0 ? (collected / total * 100) : 0;
 
@@ -458,7 +465,9 @@ class _DashboardPageState extends State<DashboardPage> {
             children: [Text('$classYear - $gender', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.grey[800])), Icon(Icons.people, color: Colors.indigo, size: 24)],
           ),
           SizedBox(height: 16),
-          _buildInfoRow('Students', data['count'].toString(), Colors.grey[800]!),
+          _buildInfoRow('Students', count.toString(), Colors.grey[800]!),
+          _buildInfoRow('Total Package', '${totalPackage.toStringAsFixed(0)} PKR', Colors.indigo),
+          _buildInfoRow('PSA', '${psa.toStringAsFixed(0)} PKR', Colors.purple),
           _buildInfoRow('Collected', '${collected.toStringAsFixed(0)} PKR', Colors.green),
           _buildInfoRow('Pending', '${pending.toStringAsFixed(0)} PKR', Colors.red),
           SizedBox(height: 12),
