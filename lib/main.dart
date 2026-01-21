@@ -1,23 +1,23 @@
-// pubspec.yaml dependencies needed:
-// dependencies:
-//   flutter:
-//     sdk: flutter
-//   sqflite_common_ffi: ^2.3.0
-//   path: ^1.8.3
-//   intl: ^0.18.1
 
-// main.dart
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'dart:io' show Platform;
 import 'package:path/path.dart' as p;
 import 'package:intl/intl.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart';
 
-void main() {
-  if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  // Only initialize sqflite_ffi on desktop platforms (not web)
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   }
+  
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(StudentManagementApp());
 }
 
