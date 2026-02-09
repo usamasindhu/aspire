@@ -1,23 +1,356 @@
-
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
-import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart' as ffi;
 import 'dart:io' show Platform;
 import 'package:path/path.dart' as p;
 import 'package:intl/intl.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'firebase_options.dart';
+
+// Global auth state
+class AuthService {
+  static final AuthService instance = AuthService._init();
+  AuthService._init();
+  
+  User? get currentUser => FirebaseAuth.instance.currentUser;
+  String get currentUserEmail => currentUser?.email ?? 'Unknown';
+  String get currentUserId => currentUser?.uid ?? '';
+  
+  Stream<User?> get authStateChanges => FirebaseAuth.instance.authStateChanges();
+  
+  Future<UserCredential> signIn(String email, String password) async {
+    return await FirebaseAuth.instance.signInWithEmailAndPassword(
+      email: email,
+      password: password,
+    );
+  }
+  
+  Future<void> signOut() async {
+    await FirebaseAuth.instance.signOut();
+  }
+}
+
+// Sync Service for Firebase
+class SyncService {
+  static final SyncService instance = SyncService._init();
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  StreamSubscription? _connectivitySubscription;
+  bool _isOnline = false;
+  bool _isSyncing = false;
+  
+  // Callbacks for UI updates
+  final _syncStatusController = StreamController<SyncStatus>.broadcast();
+  Stream<SyncStatus> get syncStatusStream => _syncStatusController.stream;
+  
+  SyncService._init();
+  
+  bool get isOnline => _isOnline;
+  
+  void init() {
+    _connectivitySubscription = Connectivity().onConnectivityChanged.listen((results) {
+      final wasOnline = _isOnline;
+      _isOnline = results.any((r) => r != ConnectivityResult.none);
+      
+      if (_isOnline && !wasOnline) {
+        // Just came online - sync pending data
+        syncPendingData();
+      }
+      _syncStatusController.add(SyncStatus(_isOnline, _isSyncing));
+    });
+    
+    // Check initial connectivity
+    Connectivity().checkConnectivity().then((results) {
+      _isOnline = results.any((r) => r != ConnectivityResult.none);
+      _syncStatusController.add(SyncStatus(_isOnline, _isSyncing));
+      if (_isOnline) {
+        syncPendingData();
+      }
+    });
+  }
+  
+  void dispose() {
+    _connectivitySubscription?.cancel();
+    _syncStatusController.close();
+  }
+  
+  // Sync all pending local data to Firebase
+  Future<void> syncPendingData() async {
+    if (_isSyncing || !_isOnline) return;
+    
+    _isSyncing = true;
+    _syncStatusController.add(SyncStatus(_isOnline, _isSyncing));
+    
+    try {
+      final db = await DatabaseHelper.instance.database;
+      
+      // Sync students
+      final pendingStudents = await db.query('students', where: 'syncStatus = ?', whereArgs: ['pending']);
+      for (var studentMap in pendingStudents) {
+        await _syncStudentToFirebase(studentMap);
+      }
+      
+      // Sync deleted students
+      final deletedStudents = await db.query('students', where: 'syncStatus = ?', whereArgs: ['deleted']);
+      for (var studentMap in deletedStudents) {
+        await _deleteStudentFromFirebase(studentMap);
+      }
+      
+      // Sync installments
+      final pendingInstallments = await db.query('installments', where: 'syncStatus = ?', whereArgs: ['pending']);
+      for (var instMap in pendingInstallments) {
+        await _syncInstallmentToFirebase(instMap);
+      }
+      
+      // Sync deleted installments
+      final deletedInstallments = await db.query('installments', where: 'syncStatus = ?', whereArgs: ['deleted']);
+      for (var instMap in deletedInstallments) {
+        await _deleteInstallmentFromFirebase(instMap);
+      }
+      
+      // Sync audit logs
+      final pendingLogs = await db.query('audit_logs', where: 'syncStatus = ?', whereArgs: ['pending']);
+      for (var logMap in pendingLogs) {
+        await _syncLogToFirebase(logMap);
+      }
+      
+    } catch (e) {
+      debugPrint('Sync error: $e');
+    } finally {
+      _isSyncing = false;
+      _syncStatusController.add(SyncStatus(_isOnline, _isSyncing));
+    }
+  }
+  
+  Future<void> _syncStudentToFirebase(Map<String, dynamic> studentMap) async {
+    try {
+      final db = await DatabaseHelper.instance.database;
+      String? firebaseId = studentMap['firebaseId'];
+      
+      final data = {
+        'name': studentMap['name'],
+        'rollNum': studentMap['rollNum'],
+        'fatherName': studentMap['fatherName'],
+        'contact': studentMap['contact'],
+        'class': studentMap['class'],
+        'gender': studentMap['gender'],
+        'discipline': studentMap['discipline'],
+        'totalPackage': studentMap['totalPackage'],
+        'paperFund': studentMap['paperFund'],
+        'localId': studentMap['id'],
+        'lastModified': FieldValue.serverTimestamp(),
+      };
+      
+      if (firebaseId != null && firebaseId.isNotEmpty) {
+        await _firestore.collection('students').doc(firebaseId).update(data);
+      } else {
+        final docRef = await _firestore.collection('students').add(data);
+        firebaseId = docRef.id;
+        await db.update('students', {'firebaseId': firebaseId}, where: 'id = ?', whereArgs: [studentMap['id']]);
+      }
+      
+      await db.update('students', {'syncStatus': 'synced'}, where: 'id = ?', whereArgs: [studentMap['id']]);
+    } catch (e) {
+      debugPrint('Error syncing student: $e');
+    }
+  }
+  
+  Future<void> _deleteStudentFromFirebase(Map<String, dynamic> studentMap) async {
+    try {
+      final db = await DatabaseHelper.instance.database;
+      final firebaseId = studentMap['firebaseId'];
+      
+      if (firebaseId != null && firebaseId.isNotEmpty) {
+        await _firestore.collection('students').doc(firebaseId).delete();
+        // Also delete related installments from Firebase
+        final installments = await _firestore.collection('installments')
+            .where('studentFirebaseId', isEqualTo: firebaseId).get();
+        for (var doc in installments.docs) {
+          await doc.reference.delete();
+        }
+      }
+      
+      // Remove from local DB
+      await db.delete('installments', where: 'studentId = ?', whereArgs: [studentMap['id']]);
+      await db.delete('students', where: 'id = ?', whereArgs: [studentMap['id']]);
+    } catch (e) {
+      debugPrint('Error deleting student from Firebase: $e');
+    }
+  }
+  
+  Future<void> _syncInstallmentToFirebase(Map<String, dynamic> instMap) async {
+    try {
+      final db = await DatabaseHelper.instance.database;
+      String? firebaseId = instMap['firebaseId'];
+      
+      // Get student's firebaseId
+      final students = await db.query('students', where: 'id = ?', whereArgs: [instMap['studentId']]);
+      if (students.isEmpty) return;
+      final studentFirebaseId = students.first['firebaseId'];
+      
+      final data = {
+        'studentId': instMap['studentId'],
+        'studentFirebaseId': studentFirebaseId,
+        'amount': instMap['amount'],
+        'date': instMap['date'],
+        'localId': instMap['id'],
+        'lastModified': FieldValue.serverTimestamp(),
+      };
+      
+      if (firebaseId != null && firebaseId.isNotEmpty) {
+        await _firestore.collection('installments').doc(firebaseId).update(data);
+      } else {
+        final docRef = await _firestore.collection('installments').add(data);
+        firebaseId = docRef.id;
+        await db.update('installments', {'firebaseId': firebaseId}, where: 'id = ?', whereArgs: [instMap['id']]);
+      }
+      
+      await db.update('installments', {'syncStatus': 'synced'}, where: 'id = ?', whereArgs: [instMap['id']]);
+    } catch (e) {
+      debugPrint('Error syncing installment: $e');
+    }
+  }
+  
+  Future<void> _deleteInstallmentFromFirebase(Map<String, dynamic> instMap) async {
+    try {
+      final db = await DatabaseHelper.instance.database;
+      final firebaseId = instMap['firebaseId'];
+      
+      if (firebaseId != null && firebaseId.isNotEmpty) {
+        await _firestore.collection('installments').doc(firebaseId).delete();
+      }
+      
+      await db.delete('installments', where: 'id = ?', whereArgs: [instMap['id']]);
+    } catch (e) {
+      debugPrint('Error deleting installment from Firebase: $e');
+    }
+  }
+  
+  Future<void> _syncLogToFirebase(Map<String, dynamic> logMap) async {
+    try {
+      final db = await DatabaseHelper.instance.database;
+      
+      final data = {
+        'action': logMap['action'],
+        'details': logMap['details'],
+        'timestamp': logMap['timestamp'],
+        'userEmail': logMap['userEmail'],
+        'userId': logMap['userId'],
+        'localId': logMap['id'],
+      };
+      
+      final docRef = await _firestore.collection('audit_logs').add(data);
+      await db.update('audit_logs', {'firebaseId': docRef.id, 'syncStatus': 'synced'}, where: 'id = ?', whereArgs: [logMap['id']]);
+    } catch (e) {
+      debugPrint('Error syncing log: $e');
+    }
+  }
+  
+  // Restore data from Firebase to local DB (for new device)
+  Future<bool> restoreFromFirebase() async {
+    if (!_isOnline) return false;
+    
+    try {
+      final db = await DatabaseHelper.instance.database;
+      
+      // Check if local DB is empty
+      final localStudents = await db.query('students');
+      if (localStudents.isNotEmpty) {
+        return false; // Already has data
+      }
+      
+      // Restore students
+      final studentsSnapshot = await _firestore.collection('students').get();
+      for (var doc in studentsSnapshot.docs) {
+        final data = doc.data();
+        await db.insert('students', {
+          'name': data['name'],
+          'rollNum': data['rollNum'],
+          'fatherName': data['fatherName'],
+          'contact': data['contact'],
+          'class': data['class'],
+          'gender': data['gender'],
+          'discipline': data['discipline'],
+          'totalPackage': data['totalPackage'],
+          'paperFund': data['paperFund'] ?? 1000,
+          'firebaseId': doc.id,
+          'syncStatus': 'synced',
+        });
+      }
+      
+      // Get updated local students to map firebaseId to localId
+      final updatedStudents = await db.query('students');
+      final firebaseToLocalId = <String, int>{};
+      for (var s in updatedStudents) {
+        if (s['firebaseId'] != null) {
+          firebaseToLocalId[s['firebaseId'] as String] = s['id'] as int;
+        }
+      }
+      
+      // Restore installments
+      final installmentsSnapshot = await _firestore.collection('installments').get();
+      for (var doc in installmentsSnapshot.docs) {
+        final data = doc.data();
+        final studentFirebaseId = data['studentFirebaseId'];
+        final localStudentId = firebaseToLocalId[studentFirebaseId];
+        
+        if (localStudentId != null) {
+          await db.insert('installments', {
+            'studentId': localStudentId,
+            'amount': data['amount'],
+            'date': data['date'],
+            'firebaseId': doc.id,
+            'syncStatus': 'synced',
+          });
+        }
+      }
+      
+      // Restore audit logs
+      final logsSnapshot = await _firestore.collection('audit_logs').orderBy('timestamp').get();
+      for (var doc in logsSnapshot.docs) {
+        final data = doc.data();
+        await db.insert('audit_logs', {
+          'action': data['action'],
+          'details': data['details'],
+          'timestamp': data['timestamp'],
+          'userEmail': data['userEmail'] ?? 'Unknown',
+          'userId': data['userId'] ?? '',
+          'firebaseId': doc.id,
+          'syncStatus': 'synced',
+        });
+      }
+      
+      return true;
+    } catch (e) {
+      debugPrint('Restore error: $e');
+      return false;
+    }
+  }
+}
+
+class SyncStatus {
+  final bool isOnline;
+  final bool isSyncing;
+  SyncStatus(this.isOnline, this.isSyncing);
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  // Only initialize sqflite_ffi on desktop platforms (not web)
+  // Initialize sqflite_ffi only on desktop platforms (Windows/Linux/macOS)
+  // Android/iOS use regular sqflite which works out of the box
   if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
-    sqfliteFfiInit();
-    databaseFactory = databaseFactoryFfi;
+    ffi.sqfliteFfiInit();
+    databaseFactory = ffi.databaseFactoryFfi;
   }
   
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  SyncService.instance.init();
+  
   runApp(StudentManagementApp());
 }
 
@@ -28,12 +361,223 @@ class StudentManagementApp extends StatelessWidget {
       title: 'Student Management System',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(primarySwatch: Colors.indigo, scaffoldBackgroundColor: Color(0xFFF5F7FA), fontFamily: 'Roboto'),
-      home: MainScreen(),
+      home: AuthWrapper(),
     );
   }
 }
 
-// Database Helper
+// Auth Wrapper - Shows login or main screen based on auth state
+class AuthWrapper extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: AuthService.instance.authStateChanges,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        
+        if (snapshot.hasData) {
+          return MainScreen();
+        }
+        
+        return LoginScreen();
+      },
+    );
+  }
+}
+
+// Login Screen
+class LoginScreen extends StatefulWidget {
+  @override
+  _LoginScreenState createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _isLoading = false;
+  bool _obscurePassword = true;
+  String? _errorMessage;
+  
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF1A237E), Color(0xFF3949AB)],
+          ),
+        ),
+        child: Center(
+          child: SingleChildScrollView(
+            child: Container(
+              width: 420,
+              margin: EdgeInsets.all(24),
+              padding: EdgeInsets.all(40),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 20, offset: Offset(0, 10))],
+              ),
+              child: Form(
+                key: _formKey,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      padding: EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Color(0xFF1A237E).withOpacity(0.1),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Icon(Icons.school, size: 48, color: Color(0xFF1A237E)),
+                    ),
+                    SizedBox(height: 24),
+                    Text('Student Portal', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Color(0xFF1A237E))),
+                    SizedBox(height: 8),
+                    Text('Sign in to continue', style: TextStyle(color: Colors.grey[600], fontSize: 16)),
+                    SizedBox(height: 32),
+                    
+                    if (_errorMessage != null)
+                      Container(
+                        padding: EdgeInsets.all(12),
+                        margin: EdgeInsets.only(bottom: 16),
+                        decoration: BoxDecoration(
+                          color: Colors.red.shade50,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.red.shade200),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.error_outline, color: Colors.red, size: 20),
+                            SizedBox(width: 8),
+                            Expanded(child: Text(_errorMessage!, style: TextStyle(color: Colors.red.shade700, fontSize: 14))),
+                          ],
+                        ),
+                      ),
+                    
+                    TextFormField(
+                      controller: _emailController,
+                      keyboardType: TextInputType.emailAddress,
+                      decoration: InputDecoration(
+                        labelText: 'Email',
+                        prefixIcon: Icon(Icons.email_outlined),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                        filled: true,
+                        fillColor: Colors.grey.shade50,
+                      ),
+                      validator: (value) {
+                        if (value?.isEmpty ?? true) return 'Email is required';
+                        if (!value!.contains('@')) return 'Enter a valid email';
+                        return null;
+                      },
+                    ),
+                    SizedBox(height: 16),
+                    
+                    TextFormField(
+                      controller: _passwordController,
+                      obscureText: _obscurePassword,
+                      decoration: InputDecoration(
+                        labelText: 'Password',
+                        prefixIcon: Icon(Icons.lock_outlined),
+                        suffixIcon: IconButton(
+                          icon: Icon(_obscurePassword ? Icons.visibility_off : Icons.visibility),
+                          onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                        ),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                        filled: true,
+                        fillColor: Colors.grey.shade50,
+                      ),
+                      validator: (value) {
+                        if (value?.isEmpty ?? true) return 'Password is required';
+                        if (value!.length < 6) return 'Password must be at least 6 characters';
+                        return null;
+                      },
+                    ),
+                    SizedBox(height: 24),
+                    
+                    SizedBox(
+                      width: double.infinity,
+                      height: 50,
+                      child: ElevatedButton(
+                        onPressed: _isLoading ? null : _signIn,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Color(0xFF1A237E),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                        child: _isLoading
+                            ? SizedBox(width: 24, height: 24, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                            : Text('Sign In', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white)),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+  
+  Future<void> _signIn() async {
+    if (!_formKey.currentState!.validate()) return;
+    
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+    
+    try {
+      await AuthService.instance.signIn(
+        _emailController.text.trim(),
+        _passwordController.text,
+      );
+      
+      // Try to restore data from Firebase for new device
+      await SyncService.instance.restoreFromFirebase();
+      
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        setState(() {
+          _errorMessage = _getAuthErrorMessage(e.code);
+        });
+      }
+    } catch (e) {
+      print('Auth error: $e');
+      if (mounted) {
+        setState(() {
+          _errorMessage = 'Error: ${e.toString().length > 100 ? e.toString().substring(0, 100) : e.toString()}';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+  
+  String _getAuthErrorMessage(String code) {
+    print('Auth error code: $code');
+    switch (code) {
+      case 'user-not-found': return 'No user found with this email.';
+      case 'wrong-password': return 'Incorrect password.';
+      case 'invalid-email': return 'Invalid email address.';
+      case 'user-disabled': return 'This account has been disabled.';
+      case 'invalid-credential': return 'Invalid email or password.';
+      case 'network-request-failed': return 'Network error. Check:\n• Internet connection\n• Firebase Auth enabled in Console\n• Firewall settings';
+      case 'too-many-requests': return 'Too many attempts. Try again later.';
+      case 'operation-not-allowed': return 'Email/Password sign-in not enabled in Firebase Console.';
+      default: return 'Authentication failed ($code).';
+    }
+  }
+}
+
+// Database Helper with sync support
 class DatabaseHelper {
   static final DatabaseHelper instance = DatabaseHelper._init();
   static Database? _database;
@@ -50,7 +594,7 @@ class DatabaseHelper {
     final dbPath = await getDatabasesPath();
     final dbFile = p.join(dbPath, filePath);
 
-    return await openDatabase(dbFile, version: 1, onCreate: _createDB);
+    return await openDatabase(dbFile, version: 2, onCreate: _createDB, onUpgrade: _upgradeDB);
   }
 
   Future _createDB(Database db, int version) async {
@@ -65,7 +609,9 @@ class DatabaseHelper {
         gender TEXT NOT NULL,
         discipline TEXT NOT NULL,
         totalPackage REAL NOT NULL,
-        paperFund REAL NOT NULL DEFAULT 1000
+        paperFund REAL NOT NULL DEFAULT 1000,
+        firebaseId TEXT,
+        syncStatus TEXT DEFAULT 'pending'
       )
     ''');
 
@@ -75,6 +621,8 @@ class DatabaseHelper {
         studentId INTEGER NOT NULL,
         amount REAL NOT NULL,
         date TEXT NOT NULL,
+        firebaseId TEXT,
+        syncStatus TEXT DEFAULT 'pending',
         FOREIGN KEY (studentId) REFERENCES students (id) ON DELETE CASCADE
       )
     ''');
@@ -84,28 +632,52 @@ class DatabaseHelper {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         action TEXT NOT NULL,
         details TEXT NOT NULL,
-        timestamp TEXT NOT NULL
+        timestamp TEXT NOT NULL,
+        userEmail TEXT NOT NULL,
+        userId TEXT NOT NULL,
+        firebaseId TEXT,
+        syncStatus TEXT DEFAULT 'pending'
       )
     ''');
   }
 
+  Future _upgradeDB(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      // Add new columns for sync
+      try { await db.execute('ALTER TABLE students ADD COLUMN firebaseId TEXT'); } catch (_) {}
+      try { await db.execute('ALTER TABLE students ADD COLUMN syncStatus TEXT DEFAULT "pending"'); } catch (_) {}
+      try { await db.execute('ALTER TABLE installments ADD COLUMN firebaseId TEXT'); } catch (_) {}
+      try { await db.execute('ALTER TABLE installments ADD COLUMN syncStatus TEXT DEFAULT "pending"'); } catch (_) {}
+      try { await db.execute('ALTER TABLE audit_logs ADD COLUMN firebaseId TEXT'); } catch (_) {}
+      try { await db.execute('ALTER TABLE audit_logs ADD COLUMN syncStatus TEXT DEFAULT "pending"'); } catch (_) {}
+      try { await db.execute('ALTER TABLE audit_logs ADD COLUMN userEmail TEXT DEFAULT "Unknown"'); } catch (_) {}
+      try { await db.execute('ALTER TABLE audit_logs ADD COLUMN userId TEXT DEFAULT ""'); } catch (_) {}
+    }
+  }
+
   Future<int> insertStudent(Student student) async {
     final db = await database;
-    final id = await db.insert('students', student.toMap());
+    final id = await db.insert('students', {...student.toMap(), 'syncStatus': 'pending'});
     await addLog('CREATE', 'Added student: ${student.name} (${student.rollNum})');
+    
+    // Try to sync immediately if online
+    SyncService.instance.syncPendingData();
     return id;
   }
 
   Future<List<Student>> getStudents() async {
     final db = await database;
-    final result = await db.query('students');
+    final result = await db.query('students', where: 'syncStatus != ?', whereArgs: ['deleted']);
     return result.map((json) => Student.fromMap(json)).toList();
   }
 
   Future<int> updateStudent(Student student) async {
     final db = await database;
     await addLog('UPDATE', 'Updated student: ${student.name} (${student.rollNum})');
-    return db.update('students', student.toMap(), where: 'id = ?', whereArgs: [student.id]);
+    final result = db.update('students', {...student.toMap(), 'syncStatus': 'pending'}, where: 'id = ?', whereArgs: [student.id]);
+    
+    SyncService.instance.syncPendingData();
+    return result;
   }
 
   Future<int> deleteStudent(int id) async {
@@ -114,31 +686,57 @@ class DatabaseHelper {
     if (student.isNotEmpty) {
       await addLog('DELETE', 'Deleted student: ${student.first['name']} (${student.first['rollNum']})');
     }
-    await db.delete('installments', where: 'studentId = ?', whereArgs: [id]);
-    return db.delete('students', where: 'id = ?', whereArgs: [id]);
+    
+    // Mark as deleted for sync
+    await db.update('students', {'syncStatus': 'deleted'}, where: 'id = ?', whereArgs: [id]);
+    await db.update('installments', {'syncStatus': 'deleted'}, where: 'studentId = ?', whereArgs: [id]);
+    
+    SyncService.instance.syncPendingData();
+    return 1;
   }
 
   Future<int> addInstallment(Installment installment) async {
     final db = await database;
-    final id = await db.insert('installments', installment.toMap());
-    await addLog('PAYMENT', 'Installment added: ${installment.amount} PKR');
+    final id = await db.insert('installments', {...installment.toMap(), 'syncStatus': 'pending'});
+    
+    // Get student name for log
+    final student = await db.query('students', where: 'id = ?', whereArgs: [installment.studentId]);
+    final studentName = student.isNotEmpty ? student.first['name'] : 'Unknown';
+    await addLog('PAYMENT', 'Installment of ${installment.amount} PKR added for $studentName');
+    
+    SyncService.instance.syncPendingData();
     return id;
   }
 
   Future<List<Installment>> getInstallments(int studentId) async {
     final db = await database;
-    final result = await db.query('installments', where: 'studentId = ?', whereArgs: [studentId]);
+    final result = await db.query('installments', where: 'studentId = ? AND syncStatus != ?', whereArgs: [studentId, 'deleted']);
     return result.map((json) => Installment.fromMap(json)).toList();
   }
 
-  Future<int> deleteInstallment(int id) async {
+  Future<int> deleteInstallment(int id, String studentName, double amount) async {
     final db = await database;
-    return db.delete('installments', where: 'id = ?', whereArgs: [id]);
+    
+    // Mark as deleted for sync
+    await db.update('installments', {'syncStatus': 'deleted'}, where: 'id = ?', whereArgs: [id]);
+    await addLog('DELETE', 'Deleted installment of $amount PKR for $studentName');
+    
+    SyncService.instance.syncPendingData();
+    return 1;
   }
 
   Future<void> addLog(String action, String details) async {
     final db = await database;
-    await db.insert('audit_logs', {'action': action, 'details': details, 'timestamp': DateTime.now().toIso8601String()});
+    await db.insert('audit_logs', {
+      'action': action,
+      'details': details,
+      'timestamp': DateTime.now().toIso8601String(),
+      'userEmail': AuthService.instance.currentUserEmail,
+      'userId': AuthService.instance.currentUserId,
+      'syncStatus': 'pending',
+    });
+    
+    SyncService.instance.syncPendingData();
   }
 
   Future<List<Map<String, dynamic>>> getLogs() async {
@@ -159,6 +757,7 @@ class Student {
   String discipline;
   double totalPackage;
   double paperFund;
+  String? firebaseId;
 
   Student({
     this.id,
@@ -171,6 +770,7 @@ class Student {
     required this.discipline,
     required this.totalPackage,
     this.paperFund = 1000,
+    this.firebaseId,
   });
 
   Map<String, dynamic> toMap() {
@@ -185,6 +785,7 @@ class Student {
       'discipline': discipline,
       'totalPackage': totalPackage,
       'paperFund': paperFund,
+      'firebaseId': firebaseId,
     };
   }
 
@@ -200,6 +801,7 @@ class Student {
       discipline: map['discipline'],
       totalPackage: map['totalPackage'],
       paperFund: map['paperFund'] ?? 1000,
+      firebaseId: map['firebaseId'],
     );
   }
 }
@@ -209,19 +811,20 @@ class Installment {
   int studentId;
   double amount;
   String date;
+  String? firebaseId;
 
-  Installment({this.id, required this.studentId, required this.amount, required this.date});
+  Installment({this.id, required this.studentId, required this.amount, required this.date, this.firebaseId});
 
   Map<String, dynamic> toMap() {
-    return {'id': id, 'studentId': studentId, 'amount': amount, 'date': date};
+    return {'id': id, 'studentId': studentId, 'amount': amount, 'date': date, 'firebaseId': firebaseId};
   }
 
   factory Installment.fromMap(Map<String, dynamic> map) {
-    return Installment(id: map['id'], studentId: map['studentId'], amount: map['amount'], date: map['date']);
+    return Installment(id: map['id'], studentId: map['studentId'], amount: map['amount'], date: map['date'], firebaseId: map['firebaseId']);
   }
 }
 
-// Main Screen
+// Main Screen with sync status indicator
 class MainScreen extends StatefulWidget {
   @override
   _MainScreenState createState() => _MainScreenState();
@@ -229,6 +832,7 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> {
   int _selectedIndex = 0;
+  bool _sidebarVisible = true;
   final dbHelper = DatabaseHelper.instance;
 
   @override
@@ -237,32 +841,160 @@ class _MainScreenState extends State<MainScreen> {
       body: Row(
         children: [
           // Sidebar
-          Container(
-            width: 260,
-            decoration: BoxDecoration(gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [Color(0xFF1A237E), Color(0xFF283593)])),
+          AnimatedContainer(
+            duration: Duration(milliseconds: 200),
+            width: _sidebarVisible ? 260 : 0,
+            child: _sidebarVisible ? Container(
+              width: 260,
+              decoration: BoxDecoration(gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [Color(0xFF1A237E), Color(0xFF283593)])),
+              child: Column(
+                children: [
+                  Container(
+                    padding: EdgeInsets.all(24),
+                    decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.indigo.shade700))),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(child: Text('Student Portal', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold))),
+                            // Sync status indicator
+                            StreamBuilder<SyncStatus>(
+                              stream: SyncService.instance.syncStatusStream,
+                              builder: (context, snapshot) {
+                                final status = snapshot.data;
+                                final isOnline = status?.isOnline ?? false;
+                                final isSyncing = status?.isSyncing ?? false;
+                                
+                                return Tooltip(
+                                  message: isSyncing ? 'Syncing...' : (isOnline ? 'Online' : 'Offline'),
+                                  child: Container(
+                                    padding: EdgeInsets.all(6),
+                                    decoration: BoxDecoration(
+                                      color: isOnline ? Colors.green.withOpacity(0.2) : Colors.orange.withOpacity(0.2),
+                                      borderRadius: BorderRadius.circular(20),
+                                    ),
+                                    child: isSyncing
+                                        ? SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                                        : Icon(isOnline ? Icons.cloud_done : Icons.cloud_off, color: isOnline ? Colors.green.shade300 : Colors.orange.shade300, size: 16),
+                                  ),
+                                );
+                              },
+                            ),
+                          ],
+                        ),
+                        SizedBox(height: 4),
+                        Text('Management System', style: TextStyle(color: Colors.indigo.shade300, fontSize: 14)),
+                        SizedBox(height: 8),
+                        // Current user
+                        Container(
+                          padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(Icons.person, color: Colors.white70, size: 14),
+                              SizedBox(width: 4),
+                              Expanded(
+                                child: Text(
+                                  AuthService.instance.currentUserEmail,
+                                  style: TextStyle(color: Colors.white70, fontSize: 12),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  SizedBox(height: 20),
+                  _buildMenuItem(0, Icons.dashboard, 'Dashboard'),
+                  _buildMenuItem(1, Icons.people, 'Students'),
+                  _buildMenuItem(2, Icons.history, 'Audit Logs'),
+                  Spacer(),
+                  // Logout button
+                  Padding(
+                    padding: EdgeInsets.all(16),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: () async {
+                          await AuthService.instance.signOut();
+                        },
+                        icon: Icon(Icons.logout, size: 18),
+                        label: Text('Sign Out'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.red.shade400,
+                          foregroundColor: Colors.white,
+                          padding: EdgeInsets.symmetric(vertical: 12),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ) : null,
+          ),
+          // Main Content
+          Expanded(
             child: Column(
               children: [
+                // Top bar with menu toggle
                 Container(
-                  padding: EdgeInsets.all(24),
-                  decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.indigo.shade700))),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  color: Colors.white,
+                  child: Row(
                     children: [
-                      Text('Student Portal', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
-                      SizedBox(height: 4),
-                      Text('Management System', style: TextStyle(color: Colors.indigo.shade300, fontSize: 14)),
+                      IconButton(
+                        icon: Icon(_sidebarVisible ? Icons.menu_open : Icons.menu, color: Color(0xFF1A237E)),
+                        onPressed: () => setState(() => _sidebarVisible = !_sidebarVisible),
+                        tooltip: _sidebarVisible ? 'Hide sidebar' : 'Show sidebar',
+                      ),
+                      if (!_sidebarVisible) ...[
+                        SizedBox(width: 8),
+                        Text('Student Portal', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1A237E))),
+                        Spacer(),
+                        // Sync indicator when sidebar hidden
+                        StreamBuilder<SyncStatus>(
+                          stream: SyncService.instance.syncStatusStream,
+                          builder: (context, snapshot) {
+                            final status = snapshot.data;
+                            final isOnline = status?.isOnline ?? false;
+                            final isSyncing = status?.isSyncing ?? false;
+                            
+                            return Container(
+                              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                              decoration: BoxDecoration(
+                                color: isOnline ? Colors.green.shade50 : Colors.orange.shade50,
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (isSyncing)
+                                    SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.indigo))
+                                  else
+                                    Icon(isOnline ? Icons.cloud_done : Icons.cloud_off, color: isOnline ? Colors.green : Colors.orange, size: 14),
+                                  SizedBox(width: 6),
+                                  Text(isSyncing ? 'Syncing' : (isOnline ? 'Online' : 'Offline'), style: TextStyle(fontSize: 12, color: isOnline ? Colors.green.shade700 : Colors.orange.shade700)),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                        SizedBox(width: 8),
+                      ],
                     ],
                   ),
                 ),
-                SizedBox(height: 20),
-                _buildMenuItem(0, Icons.dashboard, 'Dashboard'),
-                _buildMenuItem(1, Icons.people, 'Students'),
-                _buildMenuItem(2, Icons.history, 'Audit Logs'),
+                Expanded(child: _getPage(_selectedIndex)),
               ],
             ),
           ),
-          // Main Content
-          Expanded(child: _getPage(_selectedIndex)),
         ],
       ),
     );
@@ -717,8 +1449,7 @@ class _StudentsPageState extends State<StudentsPage> {
   }
 
   Future<void> _deleteInstallment(Installment inst, Student student) async {
-    await dbHelper.deleteInstallment(inst.id!);
-    await dbHelper.addLog('DELETE', 'Deleted installment of ${inst.amount} PKR for ${student.name}');
+    await dbHelper.deleteInstallment(inst.id!, student.name, inst.amount);
     _loadData();
   }
 }
@@ -909,6 +1640,7 @@ class _AddEditStudentDialogState extends State<AddEditStudentDialog> {
         discipline: selectedDiscipline,
         totalPackage: double.parse(totalPackageController.text),
         paperFund: double.parse(paperFundController.text),
+        firebaseId: widget.student?.firebaseId,
       );
 
       if (widget.student == null) {
@@ -1009,7 +1741,7 @@ class _AddInstallmentDialogState extends State<AddInstallmentDialog> {
   }
 }
 
-// Audit Logs Page
+// Audit Logs Page - now shows user info
 class AuditLogsPage extends StatefulWidget {
   @override
   _AuditLogsPageState createState() => _AuditLogsPageState();
@@ -1100,6 +1832,7 @@ class _AuditLogsPageState extends State<AuditLogsPage> {
 
     final timestamp = DateTime.parse(log['timestamp']);
     final formattedTime = DateFormat('dd MMM yyyy, hh:mm a').format(timestamp);
+    final userEmail = log['userEmail'] ?? 'Unknown';
 
     return Container(
       margin: EdgeInsets.only(bottom: 12),
@@ -1120,7 +1853,17 @@ class _AuditLogsPageState extends State<AuditLogsPage> {
               children: [
                 Text(log['details'], style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
                 SizedBox(height: 4),
-                Text(formattedTime, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+                Row(
+                  children: [
+                    Icon(Icons.person, size: 12, color: Colors.grey[500]),
+                    SizedBox(width: 4),
+                    Text(userEmail, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+                    SizedBox(width: 12),
+                    Icon(Icons.access_time, size: 12, color: Colors.grey[500]),
+                    SizedBox(width: 4),
+                    Text(formattedTime, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+                  ],
+                ),
               ],
             ),
           ),
