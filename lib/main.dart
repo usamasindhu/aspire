@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:sqflite/sqflite.dart';
@@ -10,7 +11,36 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:fl_chart/fl_chart.dart';
 import 'firebase_options.dart';
+
+// Expense Categories
+const List<String> expenseCategories = [
+  'Teacher Salary',
+  'Staff',
+  'Electricity',
+  'Rent',
+  'Stationary',
+  'Maintenance',
+  'Marketing',
+  'Tax',
+  'Royalty',
+  'Other',
+];
+
+// Category colors for charts
+final Map<String, Color> categoryColors = {
+  'Teacher Salary': Colors.blue,
+  'Staff': Colors.green,
+  'Electricity': Colors.amber,
+  'Rent': Colors.purple,
+  'Stationary': Colors.orange,
+  'Maintenance': Colors.teal,
+  'Marketing': Colors.pink,
+  'Tax': Colors.red,
+  'Royalty': Colors.indigo,
+  'Other': Colors.grey,
+};
 
 // Global auth state
 class AuthService {
@@ -116,6 +146,18 @@ class SyncService {
       final pendingLogs = await db.query('audit_logs', where: 'syncStatus = ?', whereArgs: ['pending']);
       for (var logMap in pendingLogs) {
         await _syncLogToFirebase(logMap);
+      }
+      
+      // Sync expenses
+      final pendingExpenses = await db.query('expenses', where: 'syncStatus = ?', whereArgs: ['pending']);
+      for (var expenseMap in pendingExpenses) {
+        await _syncExpenseToFirebase(expenseMap);
+      }
+      
+      // Sync deleted expenses
+      final deletedExpenses = await db.query('expenses', where: 'syncStatus = ?', whereArgs: ['deleted']);
+      for (var expenseMap in deletedExpenses) {
+        await _deleteExpenseFromFirebase(expenseMap);
       }
       
     } catch (e) {
@@ -250,6 +292,51 @@ class SyncService {
     }
   }
   
+  Future<void> _syncExpenseToFirebase(Map<String, dynamic> expenseMap) async {
+    try {
+      final db = await DatabaseHelper.instance.database;
+      String? firebaseId = expenseMap['firebaseId'];
+      
+      final data = {
+        'category': expenseMap['category'],
+        'amount': expenseMap['amount'],
+        'date': expenseMap['date'],
+        'notes': expenseMap['notes'],
+        'userEmail': expenseMap['userEmail'],
+        'userId': expenseMap['userId'],
+        'localId': expenseMap['id'],
+        'lastModified': FieldValue.serverTimestamp(),
+      };
+      
+      if (firebaseId != null && firebaseId.isNotEmpty) {
+        await _firestore.collection('expenses').doc(firebaseId).update(data);
+      } else {
+        final docRef = await _firestore.collection('expenses').add(data);
+        firebaseId = docRef.id;
+        await db.update('expenses', {'firebaseId': firebaseId}, where: 'id = ?', whereArgs: [expenseMap['id']]);
+      }
+      
+      await db.update('expenses', {'syncStatus': 'synced'}, where: 'id = ?', whereArgs: [expenseMap['id']]);
+    } catch (e) {
+      debugPrint('Error syncing expense: $e');
+    }
+  }
+  
+  Future<void> _deleteExpenseFromFirebase(Map<String, dynamic> expenseMap) async {
+    try {
+      final db = await DatabaseHelper.instance.database;
+      final firebaseId = expenseMap['firebaseId'];
+      
+      if (firebaseId != null && firebaseId.isNotEmpty) {
+        await _firestore.collection('expenses').doc(firebaseId).delete();
+      }
+      
+      await db.delete('expenses', where: 'id = ?', whereArgs: [expenseMap['id']]);
+    } catch (e) {
+      debugPrint('Error deleting expense from Firebase: $e');
+    }
+  }
+  
   // Restore data from Firebase to local DB (for new device)
   Future<bool> restoreFromFirebase() async {
     if (!_isOnline) return false;
@@ -317,6 +404,22 @@ class SyncService {
           'action': data['action'],
           'details': data['details'],
           'timestamp': data['timestamp'],
+          'userEmail': data['userEmail'] ?? 'Unknown',
+          'userId': data['userId'] ?? '',
+          'firebaseId': doc.id,
+          'syncStatus': 'synced',
+        });
+      }
+      
+      // Restore expenses
+      final expensesSnapshot = await _firestore.collection('expenses').get();
+      for (var doc in expensesSnapshot.docs) {
+        final data = doc.data();
+        await db.insert('expenses', {
+          'category': data['category'],
+          'amount': data['amount'],
+          'date': data['date'],
+          'notes': data['notes'],
           'userEmail': data['userEmail'] ?? 'Unknown',
           'userId': data['userId'] ?? '',
           'firebaseId': doc.id,
@@ -594,7 +697,7 @@ class DatabaseHelper {
     final dbPath = await getDatabasesPath();
     final dbFile = p.join(dbPath, filePath);
 
-    return await openDatabase(dbFile, version: 2, onCreate: _createDB, onUpgrade: _upgradeDB);
+    return await openDatabase(dbFile, version: 3, onCreate: _createDB, onUpgrade: _upgradeDB);
   }
 
   Future _createDB(Database db, int version) async {
@@ -639,6 +742,20 @@ class DatabaseHelper {
         syncStatus TEXT DEFAULT 'pending'
       )
     ''');
+
+    await db.execute('''
+      CREATE TABLE expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category TEXT NOT NULL,
+        amount REAL NOT NULL,
+        date TEXT NOT NULL,
+        notes TEXT,
+        userEmail TEXT NOT NULL,
+        userId TEXT NOT NULL,
+        firebaseId TEXT,
+        syncStatus TEXT DEFAULT 'pending'
+      )
+    ''');
   }
 
   Future _upgradeDB(Database db, int oldVersion, int newVersion) async {
@@ -652,6 +769,24 @@ class DatabaseHelper {
       try { await db.execute('ALTER TABLE audit_logs ADD COLUMN syncStatus TEXT DEFAULT "pending"'); } catch (_) {}
       try { await db.execute('ALTER TABLE audit_logs ADD COLUMN userEmail TEXT DEFAULT "Unknown"'); } catch (_) {}
       try { await db.execute('ALTER TABLE audit_logs ADD COLUMN userId TEXT DEFAULT ""'); } catch (_) {}
+    }
+    if (oldVersion < 3) {
+      // Add expenses table
+      try {
+        await db.execute('''
+          CREATE TABLE expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            amount REAL NOT NULL,
+            date TEXT NOT NULL,
+            notes TEXT,
+            userEmail TEXT NOT NULL,
+            userId TEXT NOT NULL,
+            firebaseId TEXT,
+            syncStatus TEXT DEFAULT 'pending'
+          )
+        ''');
+      } catch (_) {}
     }
   }
 
@@ -743,6 +878,93 @@ class DatabaseHelper {
     final db = await database;
     return db.query('audit_logs', orderBy: 'id DESC', limit: 100);
   }
+
+  // Expense CRUD operations
+  Future<int> insertExpense(Expense expense) async {
+    final db = await database;
+    final id = await db.insert('expenses', {
+      ...expense.toMap(),
+      'userEmail': AuthService.instance.currentUserEmail,
+      'userId': AuthService.instance.currentUserId,
+      'syncStatus': 'pending',
+    });
+    await addLog('EXPENSE', 'Added expense: ${expense.category} - ${expense.amount} PKR');
+    SyncService.instance.syncPendingData();
+    return id;
+  }
+
+  Future<List<Expense>> getExpenses() async {
+    final db = await database;
+    final result = await db.query('expenses', where: 'syncStatus != ?', whereArgs: ['deleted'], orderBy: 'date DESC');
+    return result.map((json) => Expense.fromMap(json)).toList();
+  }
+
+  Future<List<Expense>> getExpensesByMonth(int year, int month) async {
+    final db = await database;
+    final startDate = DateTime(year, month, 1).toIso8601String();
+    final endDate = DateTime(year, month + 1, 0, 23, 59, 59).toIso8601String();
+    final result = await db.query(
+      'expenses',
+      where: 'date >= ? AND date <= ? AND syncStatus != ?',
+      whereArgs: [startDate, endDate, 'deleted'],
+      orderBy: 'date DESC',
+    );
+    return result.map((json) => Expense.fromMap(json)).toList();
+  }
+
+  Future<List<Expense>> getExpensesByYear(int year) async {
+    final db = await database;
+    final startDate = DateTime(year, 1, 1).toIso8601String();
+    final endDate = DateTime(year, 12, 31, 23, 59, 59).toIso8601String();
+    final result = await db.query(
+      'expenses',
+      where: 'date >= ? AND date <= ? AND syncStatus != ?',
+      whereArgs: [startDate, endDate, 'deleted'],
+      orderBy: 'date DESC',
+    );
+    return result.map((json) => Expense.fromMap(json)).toList();
+  }
+
+  Future<int> updateExpense(Expense expense) async {
+    final db = await database;
+    await addLog('UPDATE', 'Updated expense: ${expense.category} - ${expense.amount} PKR');
+    final result = await db.update('expenses', {...expense.toMap(), 'syncStatus': 'pending'}, where: 'id = ?', whereArgs: [expense.id]);
+    SyncService.instance.syncPendingData();
+    return result;
+  }
+
+  Future<int> deleteExpense(int id, String category, double amount) async {
+    final db = await database;
+    await db.update('expenses', {'syncStatus': 'deleted'}, where: 'id = ?', whereArgs: [id]);
+    await addLog('DELETE', 'Deleted expense: $category - $amount PKR');
+    SyncService.instance.syncPendingData();
+    return 1;
+  }
+
+  // Get all installments for a date range (for reports)
+  Future<List<Installment>> getAllInstallmentsByMonth(int year, int month) async {
+    final db = await database;
+    final startDate = DateTime(year, month, 1).toIso8601String();
+    final endDate = DateTime(year, month + 1, 0, 23, 59, 59).toIso8601String();
+    final result = await db.query(
+      'installments',
+      where: 'date >= ? AND date <= ? AND syncStatus != ?',
+      whereArgs: [startDate, endDate, 'deleted'],
+    );
+    return result.map((json) => Installment.fromMap(json)).toList();
+  }
+
+  Future<List<Installment>> getAllInstallmentsByYear(int year) async {
+    final db = await database;
+    final startDate = DateTime(year, 1, 1).toIso8601String();
+    final endDate = DateTime(year, 12, 31, 23, 59, 59).toIso8601String();
+    final result = await db.query(
+      'installments',
+      where: 'date >= ? AND date <= ? AND syncStatus != ?',
+      whereArgs: [startDate, endDate, 'deleted'],
+    );
+    return result.map((json) => Installment.fromMap(json)).toList();
+  }
 }
 
 // Models
@@ -821,6 +1043,52 @@ class Installment {
 
   factory Installment.fromMap(Map<String, dynamic> map) {
     return Installment(id: map['id'], studentId: map['studentId'], amount: map['amount'], date: map['date'], firebaseId: map['firebaseId']);
+  }
+}
+
+class Expense {
+  int? id;
+  String category;
+  double amount;
+  String date;
+  String? notes;
+  String? firebaseId;
+  String? userEmail;
+  String? userId;
+
+  Expense({
+    this.id,
+    required this.category,
+    required this.amount,
+    required this.date,
+    this.notes,
+    this.firebaseId,
+    this.userEmail,
+    this.userId,
+  });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'category': category,
+      'amount': amount,
+      'date': date,
+      'notes': notes,
+      'firebaseId': firebaseId,
+    };
+  }
+
+  factory Expense.fromMap(Map<String, dynamic> map) {
+    return Expense(
+      id: map['id'],
+      category: map['category'],
+      amount: map['amount'],
+      date: map['date'],
+      notes: map['notes'],
+      firebaseId: map['firebaseId'],
+      userEmail: map['userEmail'],
+      userId: map['userId'],
+    );
   }
 }
 
@@ -913,7 +1181,9 @@ class _MainScreenState extends State<MainScreen> {
                   SizedBox(height: 20),
                   _buildMenuItem(0, Icons.dashboard, 'Dashboard'),
                   _buildMenuItem(1, Icons.people, 'Students'),
-                  _buildMenuItem(2, Icons.history, 'Audit Logs'),
+                  _buildMenuItem(2, Icons.receipt_long, 'Expenses'),
+                  _buildMenuItem(3, Icons.analytics, 'Reports'),
+                  _buildMenuItem(4, Icons.history, 'Audit Logs'),
                   Spacer(),
                   // Logout button
                   Padding(
@@ -1032,6 +1302,10 @@ class _MainScreenState extends State<MainScreen> {
       case 1:
         return StudentsPage();
       case 2:
+        return ExpensesPage();
+      case 3:
+        return ReportsPage();
+      case 4:
         return AuditLogsPage();
       default:
         return DashboardPage();
@@ -1049,6 +1323,9 @@ class _DashboardPageState extends State<DashboardPage> {
   final dbHelper = DatabaseHelper.instance;
   List<Student> students = [];
   Map<String, List<Installment>> installmentsMap = {};
+  List<Expense> expensesYTD = [];
+  List<Expense> expensesThisMonth = [];
+  List<Installment> installmentsThisMonth = [];
   bool isLoading = true;
 
   @override
@@ -1058,10 +1335,14 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> _loadData() async {
+    final now = DateTime.now();
     students = await dbHelper.getStudents();
     for (var student in students) {
       installmentsMap[student.id.toString()] = await dbHelper.getInstallments(student.id!);
     }
+    expensesYTD = await dbHelper.getExpensesByYear(now.year);
+    expensesThisMonth = await dbHelper.getExpensesByMonth(now.year, now.month);
+    installmentsThisMonth = await dbHelper.getAllInstallmentsByMonth(now.year, now.month);
     setState(() => isLoading = false);
   }
 
@@ -1102,6 +1383,13 @@ class _DashboardPageState extends State<DashboardPage> {
     final totalCollected = stats.values.fold(0.0, (sum, s) => sum + s['collected']);
     final totalPending = stats.values.fold(0.0, (sum, s) => sum + s['pending']);
     final totalPackage = stats.values.fold(0.0, (sum, s) => sum + s['totalPackage']);
+    
+    // Expense calculations
+    final totalExpensesYTD = expensesYTD.fold(0.0, (sum, e) => sum + e.amount);
+    final totalExpensesThisMonth = expensesThisMonth.fold(0.0, (sum, e) => sum + e.amount);
+    final collectedThisMonth = installmentsThisMonth.fold(0.0, (sum, i) => sum + i.amount);
+    final profitThisMonth = collectedThisMonth - totalExpensesThisMonth;
+    final monthName = DateFormat('MMMM').format(DateTime.now());
 
     return SingleChildScrollView(
       padding: EdgeInsets.all(24),
@@ -1111,7 +1399,7 @@ class _DashboardPageState extends State<DashboardPage> {
           Text('Dashboard', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.grey[800])),
           SizedBox(height: 24),
 
-          // Summary Cards
+          // Summary Cards - Row 1 (Students)
           Row(
             children: [
               Expanded(child: _buildStatCard('11th Year Students', total11th.toString(), Icons.school, Colors.blue)),
@@ -1123,6 +1411,21 @@ class _DashboardPageState extends State<DashboardPage> {
               Expanded(child: _buildStatCard('Total Collected', '${totalCollected.toStringAsFixed(0)} PKR', Icons.account_balance_wallet, Colors.teal)),
               SizedBox(width: 16),
               Expanded(child: _buildStatCard('Total Pending', '${totalPending.toStringAsFixed(0)} PKR', Icons.pending_actions, Colors.orange)),
+            ],
+          ),
+          
+          SizedBox(height: 16),
+          
+          // Summary Cards - Row 2 (Expenses)
+          Row(
+            children: [
+              Expanded(child: _buildStatCard('Expenses YTD', '${totalExpensesYTD.toStringAsFixed(0)} PKR', Icons.receipt_long, Colors.red)),
+              SizedBox(width: 16),
+              Expanded(child: _buildStatCard('$monthName Expenses', '${totalExpensesThisMonth.toStringAsFixed(0)} PKR', Icons.calendar_month, Colors.deepOrange)),
+              SizedBox(width: 16),
+              Expanded(child: _buildStatCard('$monthName Collections', '${collectedThisMonth.toStringAsFixed(0)} PKR', Icons.payments, Colors.cyan)),
+              SizedBox(width: 16),
+              Expanded(child: _buildStatCard('$monthName Profit/Loss', '${profitThisMonth >= 0 ? '+' : ''}${profitThisMonth.toStringAsFixed(0)} PKR', Icons.trending_up, profitThisMonth >= 0 ? Colors.green : Colors.red)),
             ],
           ),
 
@@ -1825,6 +2128,10 @@ class _AuditLogsPageState extends State<AuditLogsPage> {
         icon = Icons.payment;
         color = Colors.teal;
         break;
+      case 'EXPENSE':
+        icon = Icons.receipt_long;
+        color = Colors.deepOrange;
+        break;
       default:
         icon = Icons.info;
         color = Colors.grey;
@@ -1871,6 +2178,1003 @@ class _AuditLogsPageState extends State<AuditLogsPage> {
             padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(12)),
             child: Text(log['action'], style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// EXPENSES PAGE
+// ============================================================================
+
+class ExpensesPage extends StatefulWidget {
+  @override
+  _ExpensesPageState createState() => _ExpensesPageState();
+}
+
+class _ExpensesPageState extends State<ExpensesPage> {
+  final dbHelper = DatabaseHelper.instance;
+  List<Expense> expenses = [];
+  bool isLoading = true;
+  String? filterCategory;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadData();
+  }
+
+  Future<void> _loadData() async {
+    expenses = await dbHelper.getExpenses();
+    setState(() => isLoading = false);
+  }
+
+  List<Expense> get filteredExpenses {
+    if (filterCategory == null) return expenses;
+    return expenses.where((e) => e.category == filterCategory).toList();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (isLoading) {
+      return Center(child: CircularProgressIndicator());
+    }
+
+    final totalExpenses = expenses.fold(0.0, (sum, e) => sum + e.amount);
+
+    return Column(
+      children: [
+        // Header
+        Container(
+          padding: EdgeInsets.all(24),
+          color: Colors.white,
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Expenses', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.grey[800])),
+                    SizedBox(height: 4),
+                    Text('Total: ${totalExpenses.toStringAsFixed(0)} PKR', style: TextStyle(color: Colors.grey[600], fontSize: 16)),
+                  ],
+                ),
+              ),
+              // Filter dropdown
+              Container(
+                padding: EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.grey.shade300),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String?>(
+                    value: filterCategory,
+                    hint: Text('All Categories'),
+                    items: [
+                      DropdownMenuItem(value: null, child: Text('All Categories')),
+                      ...expenseCategories.map((c) => DropdownMenuItem(value: c, child: Text(c))),
+                    ],
+                    onChanged: (value) => setState(() => filterCategory = value),
+                  ),
+                ),
+              ),
+              SizedBox(width: 16),
+              ElevatedButton.icon(
+                onPressed: () => _showAddEditExpenseDialog(null),
+                icon: Icon(Icons.add),
+                label: Text('Add Expense'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Color(0xFF1A237E),
+                  foregroundColor: Colors.white,
+                  padding: EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+              ),
+            ],
+          ),
+        ),
+        // Expense List
+        Expanded(
+          child: filteredExpenses.isEmpty
+              ? Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.receipt_long, size: 64, color: Colors.grey[400]),
+                      SizedBox(height: 16),
+                      Text('No expenses recorded', style: TextStyle(color: Colors.grey[600], fontSize: 18)),
+                    ],
+                  ),
+                )
+              : ListView.builder(
+                  padding: EdgeInsets.all(24),
+                  itemCount: filteredExpenses.length,
+                  itemBuilder: (context, index) => _buildExpenseCard(filteredExpenses[index]),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildExpenseCard(Expense expense) {
+    final color = categoryColors[expense.category] ?? Colors.grey;
+    final date = DateTime.parse(expense.date);
+    final formattedDate = DateFormat('dd MMM yyyy').format(date);
+
+    return Container(
+      margin: EdgeInsets.only(bottom: 12),
+      padding: EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4, offset: Offset(0, 2))],
+        border: Border(left: BorderSide(color: color, width: 4)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: EdgeInsets.all(12),
+            decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(12)),
+            child: Icon(Icons.receipt, color: color, size: 28),
+          ),
+          SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(expense.category, style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.grey[800])),
+                SizedBox(height: 4),
+                Text(formattedDate, style: TextStyle(color: Colors.grey[600], fontSize: 13)),
+                if (expense.notes != null && expense.notes!.isNotEmpty) ...[
+                  SizedBox(height: 4),
+                  Text(expense.notes!, style: TextStyle(color: Colors.grey[500], fontSize: 12, fontStyle: FontStyle.italic)),
+                ],
+              ],
+            ),
+          ),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text('${expense.amount.toStringAsFixed(0)} PKR', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: color)),
+              SizedBox(height: 8),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    icon: Icon(Icons.edit, color: Colors.blue, size: 20),
+                    onPressed: () => _showAddEditExpenseDialog(expense),
+                    tooltip: 'Edit',
+                    constraints: BoxConstraints(),
+                    padding: EdgeInsets.all(8),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.delete, color: Colors.red, size: 20),
+                    onPressed: () => _deleteExpense(expense),
+                    tooltip: 'Delete',
+                    constraints: BoxConstraints(),
+                    padding: EdgeInsets.all(8),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showAddEditExpenseDialog(Expense? expense) {
+    showDialog(
+      context: context,
+      builder: (context) => AddEditExpenseDialog(
+        expense: expense,
+        onSave: () => _loadData(),
+      ),
+    );
+  }
+
+  Future<void> _deleteExpense(Expense expense) async {
+    bool? confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Delete Expense'),
+        content: Text('Are you sure you want to delete this ${expense.category} expense of ${expense.amount} PKR?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      await dbHelper.deleteExpense(expense.id!, expense.category, expense.amount);
+      _loadData();
+    }
+  }
+}
+
+// Add/Edit Expense Dialog
+class AddEditExpenseDialog extends StatefulWidget {
+  final Expense? expense;
+  final VoidCallback onSave;
+
+  AddEditExpenseDialog({this.expense, required this.onSave});
+
+  @override
+  _AddEditExpenseDialogState createState() => _AddEditExpenseDialogState();
+}
+
+class _AddEditExpenseDialogState extends State<AddEditExpenseDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late TextEditingController amountController;
+  late TextEditingController notesController;
+  String selectedCategory = expenseCategories[0];
+  DateTime selectedDate = DateTime.now();
+
+  @override
+  void initState() {
+    super.initState();
+    amountController = TextEditingController(text: widget.expense?.amount.toString() ?? '');
+    notesController = TextEditingController(text: widget.expense?.notes ?? '');
+    if (widget.expense != null) {
+      selectedCategory = widget.expense!.category;
+      selectedDate = DateTime.parse(widget.expense!.date);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Container(
+        width: 450,
+        padding: EdgeInsets.all(24),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                widget.expense == null ? 'Add Expense' : 'Edit Expense',
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+              ),
+              SizedBox(height: 24),
+
+              // Category Dropdown
+              DropdownButtonFormField<String>(
+                value: selectedCategory,
+                decoration: InputDecoration(
+                  labelText: 'Category',
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  prefixIcon: Icon(Icons.category),
+                ),
+                items: expenseCategories.map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
+                onChanged: (value) => setState(() => selectedCategory = value!),
+              ),
+              SizedBox(height: 16),
+
+              // Amount
+              TextFormField(
+                controller: amountController,
+                decoration: InputDecoration(
+                  labelText: 'Amount (PKR)',
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  prefixIcon: Icon(Icons.attach_money),
+                ),
+                keyboardType: TextInputType.number,
+                validator: (value) {
+                  if (value?.isEmpty ?? true) return 'Required';
+                  if (double.tryParse(value!) == null) return 'Invalid amount';
+                  return null;
+                },
+              ),
+              SizedBox(height: 16),
+
+              // Date Picker
+              InkWell(
+                onTap: () async {
+                  final date = await showDatePicker(
+                    context: context,
+                    initialDate: selectedDate,
+                    firstDate: DateTime(2020),
+                    lastDate: DateTime(2030),
+                  );
+                  if (date != null) setState(() => selectedDate = date);
+                },
+                child: InputDecorator(
+                  decoration: InputDecoration(
+                    labelText: 'Date',
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                    prefixIcon: Icon(Icons.calendar_today),
+                  ),
+                  child: Text(DateFormat('dd MMM yyyy').format(selectedDate)),
+                ),
+              ),
+              SizedBox(height: 16),
+
+              // Notes (optional)
+              TextFormField(
+                controller: notesController,
+                decoration: InputDecoration(
+                  labelText: 'Notes (optional)',
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                  prefixIcon: Icon(Icons.notes),
+                ),
+                maxLines: 2,
+              ),
+              SizedBox(height: 24),
+
+              // Buttons
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(onPressed: () => Navigator.pop(context), child: Text('Cancel')),
+                  SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: _saveExpense,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Color(0xFF1A237E),
+                      foregroundColor: Colors.white,
+                      padding: EdgeInsets.symmetric(horizontal: 32, vertical: 12),
+                    ),
+                    child: Text(widget.expense == null ? 'Add' : 'Save'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _saveExpense() async {
+    if (_formKey.currentState!.validate()) {
+      final expense = Expense(
+        id: widget.expense?.id,
+        category: selectedCategory,
+        amount: double.parse(amountController.text),
+        date: selectedDate.toIso8601String(),
+        notes: notesController.text.isEmpty ? null : notesController.text,
+        firebaseId: widget.expense?.firebaseId,
+      );
+
+      if (widget.expense == null) {
+        await DatabaseHelper.instance.insertExpense(expense);
+      } else {
+        await DatabaseHelper.instance.updateExpense(expense);
+      }
+
+      widget.onSave();
+      Navigator.pop(context);
+    }
+  }
+}
+
+// ============================================================================
+// REPORTS PAGE
+// ============================================================================
+
+class ReportsPage extends StatefulWidget {
+  @override
+  _ReportsPageState createState() => _ReportsPageState();
+}
+
+class _ReportsPageState extends State<ReportsPage> {
+  final dbHelper = DatabaseHelper.instance;
+  int selectedYear = DateTime.now().year;
+  Map<int, double> monthlyCollections = {};
+  Map<int, double> monthlyExpenses = {};
+  List<Expense> yearExpenses = [];
+  bool isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadData();
+  }
+
+  Future<void> _loadData() async {
+    setState(() => isLoading = true);
+    
+    yearExpenses = await dbHelper.getExpensesByYear(selectedYear);
+    
+    // Calculate monthly data
+    monthlyCollections = {};
+    monthlyExpenses = {};
+    
+    for (int month = 1; month <= 12; month++) {
+      final installments = await dbHelper.getAllInstallmentsByMonth(selectedYear, month);
+      final expenses = await dbHelper.getExpensesByMonth(selectedYear, month);
+      
+      monthlyCollections[month] = installments.fold(0.0, (sum, i) => sum + i.amount);
+      monthlyExpenses[month] = expenses.fold(0.0, (sum, e) => sum + e.amount);
+    }
+    
+    setState(() => isLoading = false);
+  }
+
+  Map<String, double> get categoryBreakdown {
+    final breakdown = <String, double>{};
+    for (var expense in yearExpenses) {
+      breakdown[expense.category] = (breakdown[expense.category] ?? 0) + expense.amount;
+    }
+    return breakdown;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (isLoading) {
+      return Center(child: CircularProgressIndicator());
+    }
+
+    final totalCollections = monthlyCollections.values.fold(0.0, (sum, v) => sum + v);
+    final totalExpenses = monthlyExpenses.values.fold(0.0, (sum, v) => sum + v);
+    final netProfit = totalCollections - totalExpenses;
+
+    return SingleChildScrollView(
+      padding: EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header with year selector
+          Row(
+            children: [
+              Text('Financial Reports', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.grey[800])),
+              Spacer(),
+              Container(
+                padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.grey.shade300),
+                ),
+                child: Row(
+                  children: [
+                    IconButton(
+                      icon: Icon(Icons.chevron_left),
+                      onPressed: () {
+                        setState(() => selectedYear--);
+                        _loadData();
+                      },
+                    ),
+                    Text('$selectedYear', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    IconButton(
+                      icon: Icon(Icons.chevron_right),
+                      onPressed: selectedYear < DateTime.now().year ? () {
+                        setState(() => selectedYear++);
+                        _loadData();
+                      } : null,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: 24),
+
+          // Summary Cards
+          Row(
+            children: [
+              Expanded(child: _buildSummaryCard('Total Collections', totalCollections, Icons.account_balance_wallet, Colors.teal)),
+              SizedBox(width: 16),
+              Expanded(child: _buildSummaryCard('Total Expenses', totalExpenses, Icons.receipt_long, Colors.red)),
+              SizedBox(width: 16),
+              Expanded(child: _buildSummaryCard('Net Profit/Loss', netProfit, Icons.trending_up, netProfit >= 0 ? Colors.green : Colors.red)),
+            ],
+          ),
+          SizedBox(height: 32),
+
+          // Monthly Calendar Grid
+          Text('Monthly Overview', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.grey[800])),
+          SizedBox(height: 16),
+          _buildMonthlyGrid(),
+          SizedBox(height: 32),
+
+          // Category Breakdown and Profit Chart
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(child: _buildCategoryBreakdown()),
+              SizedBox(width: 24),
+              Expanded(child: _buildProfitChart()),
+            ],
+          ),
+          SizedBox(height: 32),
+
+          // Top Categories
+          _buildTopCategories(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSummaryCard(String title, double value, IconData icon, Color color) {
+    return Container(
+      padding: EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 8, offset: Offset(0, 4))],
+        border: Border(left: BorderSide(color: color, width: 4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: color.withOpacity(0.7), size: 32),
+              Spacer(),
+            ],
+          ),
+          SizedBox(height: 12),
+          Text(title, style: TextStyle(color: Colors.grey[600], fontSize: 14)),
+          SizedBox(height: 4),
+          Text(
+            '${value >= 0 ? '' : '-'}${value.abs().toStringAsFixed(0)} PKR',
+            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: color),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMonthlyGrid() {
+    final months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+    return GridView.builder(
+      shrinkWrap: true,
+      physics: NeverScrollableScrollPhysics(),
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 4,
+        mainAxisSpacing: 16,
+        crossAxisSpacing: 16,
+        childAspectRatio: 1.5,
+      ),
+      itemCount: 12,
+      itemBuilder: (context, index) {
+        final month = index + 1;
+        final collected = monthlyCollections[month] ?? 0;
+        final expenses = monthlyExpenses[month] ?? 0;
+        final profit = collected - expenses;
+        final isCurrentMonth = selectedYear == DateTime.now().year && month == DateTime.now().month;
+
+        return InkWell(
+          onTap: () => _showMonthDetails(month),
+          child: Container(
+            padding: EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+              border: isCurrentMonth ? Border.all(color: Color(0xFF1A237E), width: 2) : null,
+              boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4, offset: Offset(0, 2))],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(months[index], style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.grey[800])),
+                    if (isCurrentMonth)
+                      Container(
+                        padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(color: Color(0xFF1A237E), borderRadius: BorderRadius.circular(4)),
+                        child: Text('NOW', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
+                      ),
+                  ],
+                ),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('C: ${collected.toStringAsFixed(0)}', style: TextStyle(fontSize: 12, color: Colors.teal)),
+                    Text('E: ${expenses.toStringAsFixed(0)}', style: TextStyle(fontSize: 12, color: Colors.red)),
+                  ],
+                ),
+                Container(
+                  padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: profit >= 0 ? Colors.green.shade50 : Colors.red.shade50,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    '${profit >= 0 ? '+' : ''}${profit.toStringAsFixed(0)}',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      color: profit >= 0 ? Colors.green : Colors.red,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildCategoryBreakdown() {
+    final breakdown = categoryBreakdown;
+    if (breakdown.isEmpty) {
+      return Container(
+        padding: EdgeInsets.all(24),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4)],
+        ),
+        child: Column(
+          children: [
+            Text('Category Breakdown', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            SizedBox(height: 24),
+            Icon(Icons.pie_chart_outline, size: 64, color: Colors.grey[400]),
+            SizedBox(height: 8),
+            Text('No expense data', style: TextStyle(color: Colors.grey[600])),
+          ],
+        ),
+      );
+    }
+
+    final total = breakdown.values.fold(0.0, (sum, v) => sum + v);
+    final sortedEntries = breakdown.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+
+    return Container(
+      padding: EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4)],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Category Breakdown', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          SizedBox(height: 24),
+          SizedBox(
+            height: 200,
+            child: PieChart(
+              PieChartData(
+                sectionsSpace: 2,
+                centerSpaceRadius: 40,
+                sections: sortedEntries.map((entry) {
+                  final color = categoryColors[entry.key] ?? Colors.grey;
+                  final percentage = (entry.value / total * 100);
+                  return PieChartSectionData(
+                    color: color,
+                    value: entry.value,
+                    title: '${percentage.toStringAsFixed(0)}%',
+                    radius: 60,
+                    titleStyle: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
+                  );
+                }).toList(),
+              ),
+            ),
+          ),
+          SizedBox(height: 16),
+          ...sortedEntries.take(5).map((entry) {
+            final color = categoryColors[entry.key] ?? Colors.grey;
+            final percentage = (entry.value / total * 100);
+            return Padding(
+              padding: EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                children: [
+                  Container(width: 12, height: 12, decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(2))),
+                  SizedBox(width: 8),
+                  Expanded(child: Text(entry.key, style: TextStyle(fontSize: 13))),
+                  Text('${percentage.toStringAsFixed(1)}%', style: TextStyle(fontSize: 13, color: Colors.grey[600])),
+                ],
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildProfitChart() {
+    final maxValue = [
+      ...monthlyCollections.values,
+      ...monthlyExpenses.values,
+    ].fold(0.0, (max, v) => v > max ? v : max);
+
+    return Container(
+      padding: EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4)],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Monthly Trend', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          SizedBox(height: 8),
+          Row(
+            children: [
+              Container(width: 12, height: 12, color: Colors.teal),
+              SizedBox(width: 4),
+              Text('Collections', style: TextStyle(fontSize: 12)),
+              SizedBox(width: 16),
+              Container(width: 12, height: 12, color: Colors.red),
+              SizedBox(width: 4),
+              Text('Expenses', style: TextStyle(fontSize: 12)),
+            ],
+          ),
+          SizedBox(height: 24),
+          SizedBox(
+            height: 250,
+            child: BarChart(
+              BarChartData(
+                alignment: BarChartAlignment.spaceAround,
+                maxY: maxValue * 1.2,
+                barTouchData: BarTouchData(enabled: true),
+                titlesData: FlTitlesData(
+                  show: true,
+                  bottomTitles: AxisTitles(
+                    sideTitles: SideTitles(
+                      showTitles: true,
+                      getTitlesWidget: (value, meta) {
+                        final months = ['J', 'F', 'M', 'A', 'M', 'J', 'J', 'A', 'S', 'O', 'N', 'D'];
+                        return Text(months[value.toInt()], style: TextStyle(fontSize: 10));
+                      },
+                    ),
+                  ),
+                  leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                  topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                  rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                ),
+                borderData: FlBorderData(show: false),
+                barGroups: List.generate(12, (index) {
+                  final month = index + 1;
+                  return BarChartGroupData(
+                    x: index,
+                    barRods: [
+                      BarChartRodData(
+                        toY: monthlyCollections[month] ?? 0,
+                        color: Colors.teal,
+                        width: 8,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                      BarChartRodData(
+                        toY: monthlyExpenses[month] ?? 0,
+                        color: Colors.red,
+                        width: 8,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ],
+                  );
+                }),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTopCategories() {
+    final breakdown = categoryBreakdown;
+    final sortedEntries = breakdown.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+    final total = breakdown.values.fold(0.0, (sum, v) => sum + v);
+
+    return Container(
+      padding: EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4)],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Top Expense Categories', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          SizedBox(height: 16),
+          if (sortedEntries.isEmpty)
+            Center(child: Text('No expense data', style: TextStyle(color: Colors.grey[600])))
+          else
+            ...sortedEntries.map((entry) {
+              final color = categoryColors[entry.key] ?? Colors.grey;
+              final percentage = total > 0 ? (entry.value / total * 100) : 0.0;
+              return Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: EdgeInsets.all(8),
+                          decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
+                          child: Icon(Icons.receipt, color: color, size: 20),
+                        ),
+                        SizedBox(width: 12),
+                        Expanded(child: Text(entry.key, style: TextStyle(fontWeight: FontWeight.w500))),
+                        Text('${entry.value.toStringAsFixed(0)} PKR', style: TextStyle(fontWeight: FontWeight.bold, color: color)),
+                      ],
+                    ),
+                    SizedBox(height: 8),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(4),
+                      child: LinearProgressIndicator(
+                        value: percentage / 100,
+                        backgroundColor: Colors.grey[200],
+                        valueColor: AlwaysStoppedAnimation<Color>(color),
+                        minHeight: 6,
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+        ],
+      ),
+    );
+  }
+
+  void _showMonthDetails(int month) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => MonthDetailPage(year: selectedYear, month: month),
+      ),
+    );
+  }
+}
+
+// Month Detail Page
+class MonthDetailPage extends StatefulWidget {
+  final int year;
+  final int month;
+
+  MonthDetailPage({required this.year, required this.month});
+
+  @override
+  _MonthDetailPageState createState() => _MonthDetailPageState();
+}
+
+class _MonthDetailPageState extends State<MonthDetailPage> {
+  final dbHelper = DatabaseHelper.instance;
+  List<Expense> expenses = [];
+  List<Installment> installments = [];
+  bool isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadData();
+  }
+
+  Future<void> _loadData() async {
+    expenses = await dbHelper.getExpensesByMonth(widget.year, widget.month);
+    installments = await dbHelper.getAllInstallmentsByMonth(widget.year, widget.month);
+    setState(() => isLoading = false);
+  }
+
+  Map<String, List<Expense>> get expensesByCategory {
+    final grouped = <String, List<Expense>>{};
+    for (var expense in expenses) {
+      grouped.putIfAbsent(expense.category, () => []).add(expense);
+    }
+    return grouped;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final monthName = DateFormat('MMMM yyyy').format(DateTime(widget.year, widget.month));
+    final totalCollected = installments.fold(0.0, (sum, i) => sum + i.amount);
+    final totalExpenses = expenses.fold(0.0, (sum, e) => sum + e.amount);
+    final profit = totalCollected - totalExpenses;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(monthName),
+        backgroundColor: Color(0xFF1A237E),
+        foregroundColor: Colors.white,
+      ),
+      body: isLoading
+          ? Center(child: CircularProgressIndicator())
+          : SingleChildScrollView(
+              padding: EdgeInsets.all(24),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Summary
+                  Row(
+                    children: [
+                      Expanded(child: _buildSummaryCard('Collected', totalCollected, Colors.teal)),
+                      SizedBox(width: 16),
+                      Expanded(child: _buildSummaryCard('Expenses', totalExpenses, Colors.red)),
+                      SizedBox(width: 16),
+                      Expanded(child: _buildSummaryCard('Profit/Loss', profit, profit >= 0 ? Colors.green : Colors.red)),
+                    ],
+                  ),
+                  SizedBox(height: 32),
+
+                  // Category breakdown
+                  Text('Expenses by Category', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+                  SizedBox(height: 16),
+                  if (expensesByCategory.isEmpty)
+                    Container(
+                      padding: EdgeInsets.all(32),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Center(
+                        child: Column(
+                          children: [
+                            Icon(Icons.receipt_long, size: 64, color: Colors.grey[400]),
+                            SizedBox(height: 16),
+                            Text('No expenses this month', style: TextStyle(color: Colors.grey[600])),
+                          ],
+                        ),
+                      ),
+                    )
+                  else
+                    ...expensesByCategory.entries.map((entry) {
+                      final categoryTotal = entry.value.fold(0.0, (sum, e) => sum + e.amount);
+                      final color = categoryColors[entry.key] ?? Colors.grey;
+                      return Container(
+                        margin: EdgeInsets.only(bottom: 12),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(12),
+                          boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4)],
+                        ),
+                        child: ExpansionTile(
+                          leading: Container(
+                            padding: EdgeInsets.all(8),
+                            decoration: BoxDecoration(color: color.withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
+                            child: Icon(Icons.receipt, color: color),
+                          ),
+                          title: Text(entry.key, style: TextStyle(fontWeight: FontWeight.bold)),
+                          subtitle: Text('${entry.value.length} expenses'),
+                          trailing: Text('${categoryTotal.toStringAsFixed(0)} PKR', style: TextStyle(fontWeight: FontWeight.bold, color: color)),
+                          children: entry.value.map((expense) {
+                            final date = DateTime.parse(expense.date);
+                            return ListTile(
+                              contentPadding: EdgeInsets.symmetric(horizontal: 24),
+                              title: Text('${expense.amount.toStringAsFixed(0)} PKR'),
+                              subtitle: Text(expense.notes ?? DateFormat('dd MMM').format(date)),
+                              trailing: Text(DateFormat('dd MMM').format(date), style: TextStyle(color: Colors.grey[600])),
+                            );
+                          }).toList(),
+                        ),
+                      );
+                    }),
+                ],
+              ),
+            ),
+    );
+  }
+
+  Widget _buildSummaryCard(String title, double value, Color color) {
+    return Container(
+      padding: EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4)],
+        border: Border(left: BorderSide(color: color, width: 4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: TextStyle(color: Colors.grey[600], fontSize: 14)),
+          SizedBox(height: 8),
+          Text(
+            '${value >= 0 ? '' : '-'}${value.abs().toStringAsFixed(0)} PKR',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: color),
           ),
         ],
       ),
