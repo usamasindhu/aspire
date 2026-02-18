@@ -45,6 +45,8 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
+  pdf: ^3.11.3
+  printing: ^5.14.2
 
 dev_dependencies:
   flutter_test:
@@ -71,6 +73,10 @@ msix_config:
   msix_version: 1.0.0.0
   logo_path: assets/images/logo.png
   capabilities: internetClient
+  certificate_path: aspire_cert.pfx
+  certificate_password: aspire2026
+  install_certificate: true
+  publisher: CN=Xrossapps, O=Xrossapps, C=PK
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 

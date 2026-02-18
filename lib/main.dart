@@ -57,6 +57,9 @@ class AuthWrapper extends StatefulWidget {
 
 class _AuthWrapperState extends State<AuthWrapper> {
   bool _checkedRememberMe = false;
+  bool _isSyncing = false;
+  bool _dataSynced = false;
+  User? _previousUser;
 
   @override
   void initState() {
@@ -72,8 +75,24 @@ class _AuthWrapperState extends State<AuthWrapper> {
       await AuthService.instance.signOut();
     }
 
+    // If user is already logged in (remember me), pull latest data
+    if (FirebaseAuth.instance.currentUser != null) {
+      await _syncData();
+    }
+
     if (mounted) {
       setState(() => _checkedRememberMe = true);
+    }
+  }
+
+  Future<void> _syncData() async {
+    if (mounted) setState(() => _isSyncing = true);
+    await SyncService.instance.restoreFromFirebase();
+    if (mounted) {
+      setState(() {
+        _isSyncing = false;
+        _dataSynced = true;
+      });
     }
   }
 
@@ -90,10 +109,47 @@ class _AuthWrapperState extends State<AuthWrapper> {
           return Scaffold(body: Center(child: CircularProgressIndicator()));
         }
 
-        if (snapshot.hasData) {
+        final user = snapshot.data;
+
+        // Detect fresh sign-in: user was null, now logged in
+        if (user != null && _previousUser == null && !_dataSynced) {
+          _previousUser = user;
+          // Schedule sync after build completes to avoid setState during build
+          WidgetsBinding.instance.addPostFrameCallback((_) => _syncData());
+        }
+        _previousUser = user;
+
+        // Show syncing screen while pulling data
+        if (_isSyncing && user != null) {
+          return Scaffold(
+            body: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 16),
+                  Text(
+                    'Syncing data...',
+                    style: TextStyle(color: Colors.grey[600], fontSize: 14),
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    'Fetching your data from the cloud',
+                    style: TextStyle(color: Colors.grey[400], fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+
+        if (user != null) {
+          // Reset sync flag when user logs out later
           return MainScreen();
         }
 
+        // User logged out — reset state for next sign-in
+        _dataSynced = false;
         return LoginScreen();
       },
     );

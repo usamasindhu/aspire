@@ -36,7 +36,7 @@ class _MainScreenState extends State<MainScreen> {
               child: Column(
                 children: [
                   Container(
-                    padding: EdgeInsets.all(24),
+                    padding: EdgeInsets.all(18),
                     decoration: BoxDecoration(border: Border(bottom: BorderSide(color: Colors.indigo.shade700))),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -98,31 +98,41 @@ class _MainScreenState extends State<MainScreen> {
                       ],
                     ),
                   ),
-                  SizedBox(height: 20),
+                  SizedBox(height: 10),
                   _buildMenuItem(0, Icons.dashboard, 'Dashboard'),
                   _buildMenuItem(1, Icons.people, 'Students'),
                   _buildMenuItem(2, Icons.receipt_long, 'Expenses'),
                   _buildMenuItem(3, Icons.analytics, 'Reports'),
                   _buildMenuItem(4, Icons.history, 'Audit Logs'),
                   Spacer(),
-                  // Logout button
+                  Divider(color: Colors.white24, height: 1),
                   Padding(
-                    padding: EdgeInsets.all(16),
-                    child: SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton.icon(
-                        onPressed: () async {
-                          await AuthService.instance.signOut();
-                        },
-                        icon: Icon(Icons.logout, size: 18),
-                        label: Text('Sign Out'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.red.shade400,
-                          foregroundColor: Colors.white,
-                          padding: EdgeInsets.symmetric(vertical: 12),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Powered by Aspire',
+                            style: TextStyle(color: Colors.white38, fontSize: 13,fontWeight: FontWeight.bold),
+                          ),
                         ),
-                      ),
+                        Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            onTap: () => setState(() => _sidebarVisible = !_sidebarVisible),
+                            borderRadius: BorderRadius.circular(8),
+                            child: Container(
+                              padding: EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                // ignore: deprecated_member_use
+                                color: Colors.white.withOpacity(0.1),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Icon(Icons.menu_open, color: Colors.white70, size: 20),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ],
@@ -133,54 +143,26 @@ class _MainScreenState extends State<MainScreen> {
           Expanded(
             child: Column(
               children: [
-                // Top bar with menu toggle
-                Container(
-                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  color: Colors.white,
-                  child: Row(
-                    children: [
-                      IconButton(
-                        icon: Icon(_sidebarVisible ? Icons.menu_open : Icons.menu, color: Color(0xFF1A237E)),
-                        onPressed: () => setState(() => _sidebarVisible = !_sidebarVisible),
-                        tooltip: _sidebarVisible ? 'Hide sidebar' : 'Show sidebar',
-                      ),
-                      if (!_sidebarVisible) ...[
-                        SizedBox(width: 8),
-                        Text('Student Portal', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1A237E))),
-                        Spacer(),
-                        // Sync indicator when sidebar hidden
-                        StreamBuilder<SyncStatus>(
-                          stream: SyncService.instance.syncStatusStream,
-                          builder: (context, snapshot) {
-                            final status = snapshot.data;
-                            final isOnline = status?.isOnline ?? false;
-                            final isSyncing = status?.isSyncing ?? false;
-                            
-                            return Container(
-                              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                              decoration: BoxDecoration(
-                                color: isOnline ? Colors.green.shade50 : Colors.orange.shade50,
-                                borderRadius: BorderRadius.circular(20),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  if (isSyncing)
-                                    SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.indigo))
-                                  else
-                                    Icon(isOnline ? Icons.cloud_done : Icons.cloud_off, color: isOnline ? Colors.green : Colors.orange, size: 14),
-                                  SizedBox(width: 6),
-                                  Text(isSyncing ? 'Syncing' : (isOnline ? 'Online' : 'Offline'), style: TextStyle(fontSize: 12, color: isOnline ? Colors.green.shade700 : Colors.orange.shade700)),
-                                ],
-                              ),
-                            );
-                          },
+                // Show appbar on non-dashboard tabs when sidebar is collapsed
+                if (!_sidebarVisible && _selectedIndex != 0)
+                  Container(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    color: Colors.white,
+                    child: Row(
+                      children: [
+                        IconButton(
+                          icon: Icon(Icons.menu, color: Color(0xFF1A237E)),
+                          onPressed: () => setState(() => _sidebarVisible = true),
+                          tooltip: 'Show sidebar',
                         ),
                         SizedBox(width: 8),
+                        Text(
+                          _getPageTitle(_selectedIndex),
+                          style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Color(0xFF1A237E)),
+                        ),
                       ],
-                    ],
+                    ),
                   ),
-                ),
                 Expanded(child: _getPage(_selectedIndex)),
               ],
             ),
@@ -218,7 +200,10 @@ class _MainScreenState extends State<MainScreen> {
   Widget _getPage(int index) {
     switch (index) {
       case 0:
-        return DashboardPage();
+        return DashboardPage(
+          sidebarVisible: _sidebarVisible,
+          onToggleSidebar: () => setState(() => _sidebarVisible = !_sidebarVisible),
+        );
       case 1:
         return StudentsPage();
       case 2:
@@ -228,7 +213,21 @@ class _MainScreenState extends State<MainScreen> {
       case 4:
         return AuditLogsPage();
       default:
-        return DashboardPage();
+        return DashboardPage(
+          sidebarVisible: _sidebarVisible,
+          onToggleSidebar: () => setState(() => _sidebarVisible = !_sidebarVisible),
+        );
+    }
+  }
+
+  String _getPageTitle(int index) {
+    switch (index) {
+      case 0: return 'Dashboard';
+      case 1: return 'Students';
+      case 2: return 'Expenses';
+      case 3: return 'Reports';
+      case 4: return 'Audit Logs';
+      default: return 'Dashboard';
     }
   }
 }

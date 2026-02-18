@@ -1,12 +1,20 @@
 import 'package:aspire/models/expense_model.dart';
 import 'package:aspire/models/installment_model.dart';
 import 'package:aspire/models/student_model.dart';
+import 'package:aspire/services/auth_service.dart';
 import 'package:aspire/services/db_helper.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 class DashboardPage extends StatefulWidget {
-  const DashboardPage({super.key});
+  final bool sidebarVisible;
+  final VoidCallback onToggleSidebar;
+
+  const DashboardPage({
+    super.key,
+    required this.sidebarVisible,
+    required this.onToggleSidebar,
+  });
 
   @override
   _DashboardPageState createState() => _DashboardPageState();
@@ -64,6 +72,15 @@ class _DashboardPageState extends State<DashboardPage> {
     return stats;
   }
 
+  String _getGreeting() {
+    final hour = DateTime.now().hour;
+    if (hour < 12) return 'Good Morning';
+    if (hour < 15) return 'Good Afternoon';
+    if (hour < 18) return 'Good Evening';
+    return 'Good Night';
+  }
+
+
   @override
   Widget build(BuildContext context) {
     if (isLoading) {
@@ -76,7 +93,7 @@ class _DashboardPageState extends State<DashboardPage> {
     final totalCollected = stats.values.fold(0.0, (sum, s) => sum + s['collected']);
     final totalPending = stats.values.fold(0.0, (sum, s) => sum + s['pending']);
     final totalPackage = stats.values.fold(0.0, (sum, s) => sum + s['totalPackage']);
-    
+
     // Expense calculations
     final totalExpensesYTD = expensesYTD.fold(0.0, (sum, e) => sum + e.amount);
     final totalExpensesThisMonth = expensesThisMonth.fold(0.0, (sum, e) => sum + e.amount);
@@ -84,13 +101,57 @@ class _DashboardPageState extends State<DashboardPage> {
     final profitThisMonth = collectedThisMonth - totalExpensesThisMonth;
     final monthName = DateFormat('MMMM').format(DateTime.now());
 
+    final greeting = _getGreeting();
+    final userName = AuthService.instance.currentUser?.displayName ??
+        AuthService.instance.currentUserEmail.split('@').first;
+    final formattedDate = DateFormat('EEEE, MMMM d, yyyy').format(DateTime.now());
+
     return SingleChildScrollView(
-      padding: EdgeInsets.all(24),
+      padding: EdgeInsets.all(10),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Dashboard', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.grey[800])),
-          SizedBox(height: 24),
+          // Header with greeting and sign out
+          Padding(
+            padding: EdgeInsets.all(10),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                if (!widget.sidebarVisible) ...[
+                  IconButton(
+                    onPressed: widget.onToggleSidebar,
+                    icon: Icon(Icons.menu, color: Color(0xFF1A237E), size: 24),
+                    tooltip: 'Show sidebar',
+                  ),
+                  SizedBox(width: 8),
+                ],
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '$greeting, $userName',
+                        style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.grey[800]),
+                      ),
+                      SizedBox(height: 4),
+                      Text(
+                        formattedDate,
+                        style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  onPressed: () async {
+                    await AuthService.instance.signOut();
+                  },
+                  icon: Icon(Icons.logout, color: Colors.red, size: 24),
+                  tooltip: 'Sign Out',
+                ),
+              ],
+            ),
+          ),
+          SizedBox(height: 10),
 
           // Summary Cards - Row 1 (Students)
           Row(
@@ -182,7 +243,7 @@ class _DashboardPageState extends State<DashboardPage> {
     return Container(
       padding: EdgeInsets.all(20),
       decoration: BoxDecoration(
-        gradient: LinearGradient(colors: [Colors.white, Colors.grey.shade50], begin: Alignment.topLeft, end: Alignment.bottomRight),
+        gradient: LinearGradient(colors: [Colors.white, Color(0xFFFAFAFA)], begin: Alignment.topLeft, end: Alignment.bottomRight),
         borderRadius: BorderRadius.circular(12),
         boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 6, offset: Offset(0, 3))],
       ),

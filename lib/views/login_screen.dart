@@ -1,5 +1,4 @@
 import 'package:aspire/services/auth_service.dart';
-import 'package:aspire/services/sync_service.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -177,9 +176,6 @@ class _LoginScreenState extends State<LoginScreen> {
 
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('remember_me', _rememberMe);
-
-      // Try to restore data from Firebase for new device
-      await SyncService.instance.restoreFromFirebase();
       
     } on FirebaseAuthException catch (e) {
       if (mounted) {

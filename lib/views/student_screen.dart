@@ -53,30 +53,91 @@ class _StudentsPageState extends State<StudentsPage> {
 
     return Column(
       children: [
+        // Header Bar
         Container(
-          padding: EdgeInsets.all(24),
-          color: Colors.white,
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: searchController,
-                  onChanged: _filterStudents,
-                  decoration: InputDecoration(
-                    hintText: 'Search by name or roll number...',
-                    prefixIcon: Icon(Icons.search),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey.shade300)),
-                    filled: true,
-                    fillColor: Colors.grey.shade50,
-                  ),
-                ),
+          padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 22),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.05),
+                blurRadius: 8,
+                offset: const Offset(0, 2),
               ),
-              SizedBox(width: 16),
-              ElevatedButton.icon(
-                onPressed: () => _showAddEditDialog(null),
-                icon: Icon(Icons.add),
-                label: Text('Add Student'),
-                style: ElevatedButton.styleFrom(padding: EdgeInsets.symmetric(horizontal: 24, vertical: 16), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+            ],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  // Title & subtitle
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Students',
+                          style: TextStyle(
+                            fontSize: 26,
+                            fontWeight: FontWeight.bold,
+                            color: const Color(0xFF1A237E),
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '${filteredStudents.length} of ${students.length} students',
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: Colors.grey[500],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  // Add Student button
+                  ElevatedButton.icon(
+                    onPressed: () => _showAddEditDialog(null),
+                    icon: const Icon(Icons.person_add_alt_1, size: 20),
+                    label: const Text('Add Student'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF1A237E),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      elevation: 0,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 18),
+              // Search bar
+              TextField(
+                controller: searchController,
+                onChanged: _filterStudents,
+                decoration: InputDecoration(
+                  hintText: 'Search by name or roll number...',
+                  hintStyle: TextStyle(color: Colors.grey[400], fontSize: 14),
+                  prefixIcon: Icon(Icons.search, color: Colors.grey[400]),
+                  contentPadding: const EdgeInsets.symmetric(vertical: 14),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: BorderSide(color: Colors.grey.shade300),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: BorderSide(color: Colors.grey.shade300),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: const BorderSide(color: Color(0xFF1A237E), width: 1.5),
+                  ),
+                  filled: true,
+                  fillColor: Colors.grey.shade50,
+                ),
               ),
             ],
           ),

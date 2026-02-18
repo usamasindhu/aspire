@@ -57,49 +57,7 @@ class SyncService {
     
     try {
       final db = await DatabaseHelper.instance.database;
-      
-      // Sync students
-      final pendingStudents = await db.query('students', where: 'syncStatus = ?', whereArgs: ['pending']);
-      for (var studentMap in pendingStudents) {
-        await _syncStudentToFirebase(studentMap);
-      }
-      
-      // Sync deleted students
-      final deletedStudents = await db.query('students', where: 'syncStatus = ?', whereArgs: ['deleted']);
-      for (var studentMap in deletedStudents) {
-        await _deleteStudentFromFirebase(studentMap);
-      }
-      
-      // Sync installments
-      final pendingInstallments = await db.query('installments', where: 'syncStatus = ?', whereArgs: ['pending']);
-      for (var instMap in pendingInstallments) {
-        await _syncInstallmentToFirebase(instMap);
-      }
-      
-      // Sync deleted installments
-      final deletedInstallments = await db.query('installments', where: 'syncStatus = ?', whereArgs: ['deleted']);
-      for (var instMap in deletedInstallments) {
-        await _deleteInstallmentFromFirebase(instMap);
-      }
-      
-      // Sync audit logs
-      final pendingLogs = await db.query('audit_logs', where: 'syncStatus = ?', whereArgs: ['pending']);
-      for (var logMap in pendingLogs) {
-        await _syncLogToFirebase(logMap);
-      }
-      
-      // Sync expenses
-      final pendingExpenses = await db.query('expenses', where: 'syncStatus = ?', whereArgs: ['pending']);
-      for (var expenseMap in pendingExpenses) {
-        await _syncExpenseToFirebase(expenseMap);
-      }
-      
-      // Sync deleted expenses
-      final deletedExpenses = await db.query('expenses', where: 'syncStatus = ?', whereArgs: ['deleted']);
-      for (var expenseMap in deletedExpenses) {
-        await _deleteExpenseFromFirebase(expenseMap);
-      }
-      
+      await _pushPendingData(db);
     } catch (e) {
       debugPrint('Sync error: $e');
     } finally {
@@ -277,39 +235,55 @@ class SyncService {
     }
   }
   
-  // Restore data from Firebase to local DB (for new device)
+  // Pull and merge data from Firebase to local DB (works on any device)
   Future<bool> restoreFromFirebase() async {
-    if (!_isOnline) return false;
-    
+    if (!_isOnline || _isSyncing) return false;
+
+    _isSyncing = true;
+    _syncStatusController.add(SyncStatus(_isOnline, _isSyncing));
+
     try {
       final db = await DatabaseHelper.instance.database;
-      
-      // Check if local DB is empty
-      final localStudents = await db.query('students');
-      if (localStudents.isNotEmpty) {
-        return false; // Already has data
-      }
-      
-      // Restore students
+
+      // First push any pending local changes so nothing is lost
+      await _pushPendingData(db);
+
+      // --- Pull students ---
       final studentsSnapshot = await _firestore.collection('students').get();
       for (var doc in studentsSnapshot.docs) {
         final data = doc.data();
-        await db.insert('students', {
-          'name': data['name'],
-          'rollNum': data['rollNum'],
-          'fatherName': data['fatherName'],
-          'contact': data['contact'],
-          'class': data['class'],
-          'gender': data['gender'],
-          'discipline': data['discipline'],
-          'totalPackage': data['totalPackage'],
-          'paperFund': data['paperFund'] ?? 1000,
-          'firebaseId': doc.id,
-          'syncStatus': 'synced',
-        });
+        final existing = await db.query('students', where: 'firebaseId = ?', whereArgs: [doc.id]);
+        if (existing.isEmpty) {
+          await db.insert('students', {
+            'name': data['name'],
+            'rollNum': data['rollNum'],
+            'fatherName': data['fatherName'],
+            'contact': data['contact'],
+            'class': data['class'],
+            'gender': data['gender'],
+            'discipline': data['discipline'],
+            'totalPackage': data['totalPackage'],
+            'paperFund': data['paperFund'] ?? 1000,
+            'firebaseId': doc.id,
+            'syncStatus': 'synced',
+          });
+        } else {
+          await db.update('students', {
+            'name': data['name'],
+            'rollNum': data['rollNum'],
+            'fatherName': data['fatherName'],
+            'contact': data['contact'],
+            'class': data['class'],
+            'gender': data['gender'],
+            'discipline': data['discipline'],
+            'totalPackage': data['totalPackage'],
+            'paperFund': data['paperFund'] ?? 1000,
+            'syncStatus': 'synced',
+          }, where: 'firebaseId = ?', whereArgs: [doc.id]);
+        }
       }
-      
-      // Get updated local students to map firebaseId to localId
+
+      // Build firebaseId -> localId map for installments
       final updatedStudents = await db.query('students');
       final firebaseToLocalId = <String, int>{};
       for (var s in updatedStudents) {
@@ -317,60 +291,104 @@ class SyncService {
           firebaseToLocalId[s['firebaseId'] as String] = s['id'] as int;
         }
       }
-      
-      // Restore installments
+
+      // --- Pull installments ---
       final installmentsSnapshot = await _firestore.collection('installments').get();
       for (var doc in installmentsSnapshot.docs) {
         final data = doc.data();
         final studentFirebaseId = data['studentFirebaseId'];
         final localStudentId = firebaseToLocalId[studentFirebaseId];
-        
+
         if (localStudentId != null) {
-          await db.insert('installments', {
-            'studentId': localStudentId,
-            'amount': data['amount'],
-            'date': data['date'],
+          final existing = await db.query('installments', where: 'firebaseId = ?', whereArgs: [doc.id]);
+          if (existing.isEmpty) {
+            await db.insert('installments', {
+              'studentId': localStudentId,
+              'amount': data['amount'],
+              'date': data['date'],
+              'firebaseId': doc.id,
+              'syncStatus': 'synced',
+            });
+          }
+        }
+      }
+
+      // --- Pull audit logs ---
+      final logsSnapshot = await _firestore.collection('audit_logs').get();
+      for (var doc in logsSnapshot.docs) {
+        final data = doc.data();
+        final existing = await db.query('audit_logs', where: 'firebaseId = ?', whereArgs: [doc.id]);
+        if (existing.isEmpty) {
+          await db.insert('audit_logs', {
+            'action': data['action'],
+            'details': data['details'],
+            'timestamp': data['timestamp'],
+            'userEmail': data['userEmail'] ?? 'Unknown',
+            'userId': data['userId'] ?? '',
             'firebaseId': doc.id,
             'syncStatus': 'synced',
           });
         }
       }
-      
-      // Restore audit logs
-      final logsSnapshot = await _firestore.collection('audit_logs').orderBy('timestamp').get();
-      for (var doc in logsSnapshot.docs) {
-        final data = doc.data();
-        await db.insert('audit_logs', {
-          'action': data['action'],
-          'details': data['details'],
-          'timestamp': data['timestamp'],
-          'userEmail': data['userEmail'] ?? 'Unknown',
-          'userId': data['userId'] ?? '',
-          'firebaseId': doc.id,
-          'syncStatus': 'synced',
-        });
-      }
-      
-      // Restore expenses
+
+      // --- Pull expenses ---
       final expensesSnapshot = await _firestore.collection('expenses').get();
       for (var doc in expensesSnapshot.docs) {
         final data = doc.data();
-        await db.insert('expenses', {
-          'category': data['category'],
-          'amount': data['amount'],
-          'date': data['date'],
-          'notes': data['notes'],
-          'userEmail': data['userEmail'] ?? 'Unknown',
-          'userId': data['userId'] ?? '',
-          'firebaseId': doc.id,
-          'syncStatus': 'synced',
-        });
+        final existing = await db.query('expenses', where: 'firebaseId = ?', whereArgs: [doc.id]);
+        if (existing.isEmpty) {
+          await db.insert('expenses', {
+            'category': data['category'],
+            'amount': data['amount'],
+            'date': data['date'],
+            'notes': data['notes'],
+            'userEmail': data['userEmail'] ?? 'Unknown',
+            'userId': data['userId'] ?? '',
+            'firebaseId': doc.id,
+            'syncStatus': 'synced',
+          });
+        }
       }
-      
+
       return true;
     } catch (e) {
-      debugPrint('Restore error: $e');
+      debugPrint('Restore/sync error: $e');
       return false;
+    } finally {
+      _isSyncing = false;
+      _syncStatusController.add(SyncStatus(_isOnline, _isSyncing));
+    }
+  }
+
+  // Helper: push pending local data (used before pulling)
+  Future<void> _pushPendingData(dynamic db) async {
+    final pendingStudents = await db.query('students', where: 'syncStatus = ?', whereArgs: ['pending']);
+    for (var studentMap in pendingStudents) {
+      await _syncStudentToFirebase(studentMap);
+    }
+    final deletedStudents = await db.query('students', where: 'syncStatus = ?', whereArgs: ['deleted']);
+    for (var studentMap in deletedStudents) {
+      await _deleteStudentFromFirebase(studentMap);
+    }
+    final pendingInstallments = await db.query('installments', where: 'syncStatus = ?', whereArgs: ['pending']);
+    for (var instMap in pendingInstallments) {
+      await _syncInstallmentToFirebase(instMap);
+    }
+    final deletedInstallments = await db.query('installments', where: 'syncStatus = ?', whereArgs: ['deleted']);
+    for (var instMap in deletedInstallments) {
+      await _deleteInstallmentFromFirebase(instMap);
+    }
+    final pendingLogs = await db.query('audit_logs', where: 'syncStatus = ?', whereArgs: ['pending']);
+    for (var logMap in pendingLogs) {
+      await _syncLogToFirebase(logMap);
+    }
+    final pendingExpenses = await db.query('expenses', where: 'syncStatus = ?', whereArgs: ['pending']);
+    for (var expenseMap in pendingExpenses) {
+      await _syncExpenseToFirebase(expenseMap);
+    }
+    final deletedExpenses = await db.query('expenses', where: 'syncStatus = ?', whereArgs: ['deleted']);
+    for (var expenseMap in deletedExpenses) {
+      await _deleteExpenseFromFirebase(expenseMap);
     }
   }
 }
